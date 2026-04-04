@@ -1,0 +1,44 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }} with Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.9', '3.10', '3.11']
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest xxhash
+
+    - name: Run tests
+      run: |
+        cd tests
+        pytest test_check_sync_pro.py -v --tb=short
+
+    - name: Test basic functionality
+      run: |
+        python3 check_sync_pro.py --help
+
+    - name: Verify script is executable
+      run: |
+        python3 -c "import check_sync_pro; print('Module imported successfully')"
