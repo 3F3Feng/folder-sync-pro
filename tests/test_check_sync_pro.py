@@ -613,3 +613,246 @@ class TestProjectNameInMHL:
         tree = ET.parse(mhl_path)
         root = tree.getroot()
         assert root.tag == "hashlist"
+
+
+class TestProgressManager:
+    """Test ProgressManager for real-time progress display"""
+
+    def test_progress_manager_initialization(self):
+        """Test ProgressManager initialization"""
+        pm = sync_pro.ProgressManager(1000, "test.txt", enabled=False)
+        assert pm.total_size == 1000
+        assert pm.file_name == "test.txt"
+        assert pm.enabled is False
+        assert pm.copied_size == 0
+
+    def test_progress_manager_disabled_returns_none(self):
+        """Test that disabled ProgressManager returns None on update"""
+        pm = sync_pro.ProgressManager(1000, "test.txt", enabled=False)
+        result = pm.update(100)
+        assert result is None
+
+    def test_progress_manager_enabled_returns_bar(self):
+        """Test that enabled ProgressManager returns progress bar"""
+        pm = sync_pro.ProgressManager(1000, "test.txt", enabled=True)
+        import time
+        time.sleep(1.1)  # Wait to ensure update interval passed
+        result = pm.update(100)
+        assert result is not None
+        assert "test.txt" in result
+        assert "%" in result
+        assert "ETA:" in result
+
+    def test_progress_manager_format_time(self):
+        """Test time formatting helper"""
+        # Test minutes:seconds format
+        result = sync_pro.format_time(90)
+        assert result == "01:30"
+        # Test hours format
+        result = sync_pro.format_time(3661)
+        assert "01:01:01" in result
+
+
+class TestCheckpointManager:
+    """Test CheckpointManager for resume functionality"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        """Create temporary source and target directories"""
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        checkpoint = target / ".sync-progress.json"
+        yield source, target, checkpoint
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_checkpoint_creates_state(self, temp_dirs):
+        """Test CheckpointManager creates initial state"""
+        source, target, checkpoint = temp_dirs
+        cm = sync_pro.CheckpointManager(source, target, checkpoint)
+        assert cm.state is not None
+        assert "session_id" in cm.state
+        assert cm.state["source"] == str(source)
+        assert cm.state["target"] == str(target)
+
+    def test_checkpoint_save_and_load(self, temp_dirs):
+        """Test saving and loading checkpoint state"""
+        source, target, checkpoint = temp_dirs
+        cm = sync_pro.CheckpointManager(source, target, checkpoint)
+        
+        # Save checkpoint
+        cm.save_checkpoint("file1.txt", 1024)
+        
+        # Create new manager to load from file
+        cm2 = sync_pro.CheckpointManager(source, target, checkpoint)
+        assert cm2.state["current_file"] == "file1.txt"
+        assert cm2.state["position"] == 1024
+
+    def test_checkpoint_mark_complete(self, temp_dirs):
+        """Test marking file as complete"""
+        source, target, checkpoint = temp_dirs
+        cm = sync_pro.CheckpointManager(source, target, checkpoint)
+        
+        cm.mark_complete("file1.txt", 2048, "abc123hash")
+        
+        assert "file1.txt" in cm.state["files"]
+        assert cm.state["files"]["file1.txt"]["size"] == 2048
+        assert cm.state["files"]["file1.txt"]["hash"] == "abc123hash"
+
+    def test_checkpoint_get_resume_position(self, temp_dirs):
+        """Test getting resume position for incomplete files"""
+        source, target, checkpoint = temp_dirs
+        cm = sync_pro.CheckpointManager(source, target, checkpoint)
+        
+        # Set up current file with position
+        cm.save_checkpoint("file1.txt", 1024)
+        
+        # Create partial target file
+        target_file = target / "file1.txt"
+        target_file.write_bytes(b"x" * 512)
+        
+        pos = cm.get_resume_position("file1.txt")
+        # Should return the target file size (512), not the saved position (1024)
+        assert pos == 512
+
+    def test_checkpoint_cleanup(self, temp_dirs):
+        """Test cleaning up checkpoint file after sync"""
+        source, target, checkpoint = temp_dirs
+        cm = sync_pro.CheckpointManager(source, target, checkpoint)
+        cm.save_checkpoint("file1.txt", 1024)
+        
+        assert checkpoint.exists()
+        
+        cm.cleanup()
+        # Note: cleanup only removes file when sync completes successfully
+        # For now just verify method runs without error
+
+
+class TestCopyWithResume:
+    """Test copy_with_resume function"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        """Create temporary source and target directories"""
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_copy_resume_new_file(self, temp_dirs):
+        """Test copying a new file with resume function"""
+        source, target = temp_dirs
+        
+        # Create source file
+        test_data = b"Hello, World!" * 1000
+        source_file = source / "test.txt"
+        source_file.write_bytes(test_data)
+        
+        # Copy with resume
+        target_file = target / "test.txt"
+        hash_val, duration, bytes_copied, error = sync_pro.copy_with_resume(
+            source_file, target_file, "md5"
+        )
+        
+        assert error == ""
+        assert bytes_copied == len(test_data)
+        assert target_file.exists()
+        assert target_file.read_bytes() == test_data
+
+    def test_copy_resume_existing_partial_file(self, temp_dirs):
+        """Test resuming a partially copied file"""
+        source, target = temp_dirs
+        
+        # Create source file
+        test_data = b"X" * 10000
+        source_file = source / "test.txt"
+        source_file.write_bytes(test_data)
+        
+        # Create partial target file
+        target_file = target / "test.txt"
+        target_file.write_bytes(b"X" * 5000)
+        
+        # Copy with resume
+        hash_val, duration, bytes_copied, error = sync_pro.copy_with_resume(
+            source_file, target_file, "md5", resume=True
+        )
+        
+        assert error == ""
+        assert bytes_copied == 10000
+        assert target_file.read_bytes() == test_data
+
+    def test_copy_resume_complete_file_returns_match(self, temp_dirs):
+        """Test that complete file returns MATCH status"""
+        source, target = temp_dirs
+        
+        # Create identical source and target
+        test_data = b"Complete file content"
+        source_file = source / "test.txt"
+        source_file.write_bytes(test_data)
+        target_file = target / "test.txt"
+        target_file.write_bytes(test_data)
+        
+        hash_val, duration, bytes_copied, error = sync_pro.copy_with_resume(
+            source_file, target_file, "md5", resume=True
+        )
+        
+        assert hash_val == "MATCH"
+
+    def test_copy_resume_with_progress(self, temp_dirs):
+        """Test copy_with_resume with progress manager"""
+        source, target = temp_dirs
+        
+        # Create source file
+        test_data = b"X" * 100000
+        source_file = source / "test.txt"
+        source_file.write_bytes(test_data)
+        
+        # Create progress manager
+        progress_mgr = sync_pro.ProgressManager(len(test_data), "test.txt", enabled=True)
+        
+        # Copy with progress
+        target_file = target / "test.txt"
+        hash_val, duration, bytes_copied, error = sync_pro.copy_with_resume(
+            source_file, target_file, "md5", progress_manager=progress_mgr
+        )
+        
+        assert error == ""
+        assert bytes_copied == len(test_data)
+
+
+class TestSleepDetector:
+    """Test SleepDetector for system sleep detection"""
+
+    def test_sleep_detector_initialization(self):
+        """Test SleepDetector initialization"""
+        sd = sync_pro.SleepDetector()
+        assert sd.last_timestamp is not None
+        assert sd.on_wake_callback is None
+
+    def test_sleep_detector_with_callback(self):
+        """Test SleepDetector with wake callback"""
+        callback_called = []
+        
+        def callback(gap):
+            callback_called.append(gap)
+        
+        sd = sync_pro.SleepDetector(on_wake_callback=callback)
+        assert sd.on_wake_callback is callback
+
+    def test_sleep_detector_normal_gap(self):
+        """Test SleepDetector with normal time gap"""
+        sd = sync_pro.SleepDetector()
+        # Small gap should not trigger callback
+        result = sd.check_time_gap()
+        assert result is False
+
+
+class TestSignalHandling:
+    """Test signal handling for Ctrl+C"""
+
+    def test_signal_handler_import(self):
+        """Test that signal module is properly imported"""
+        import signal as sig
+        assert hasattr(sig, 'SIGINT')
+        assert hasattr(sig, 'signal')

@@ -36,13 +36,14 @@ import shutil
 import socket
 import sys
 import time
+import signal
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable
 from xml.dom import minidom
 
 # =============================================================================
@@ -120,9 +121,11 @@ class MultiSourceResult:
     end_time: float = 0.0
 
 
-# =============================================================================
-# 4. Core Functions (哈希计算、拷贝)
-# =============================================================================
+# 临时前向声明，避免循环依赖
+ProgressManager = None
+CheckpointManager = None
+SleepDetector = None
+
 
 def get_hash_func(algorithm: str):
     """获取哈希函数"""
@@ -168,6 +171,119 @@ def compute_file_hash(
                 time.sleep(wait_time)
 
     return "", time.time() - start_time, bytes_read, last_error
+
+
+# =============================================================================
+# 4a. Classes (ProgressManager, CheckpointManager, SleepDetector)
+# =============================================================================
+
+# NOTE: The following functions will reference these classes, so they are defined first.
+# See below for copy_with_resume and copy_with_streaming_hash
+
+
+def copy_with_resume(
+    source_path: Path,
+    target_path: Path,
+    algorithm: str,
+    checkpoint_manager: Optional[CheckpointManager] = None,
+    progress_manager: Optional[ProgressManager] = None,
+    chunk_size: int = 1024 * 1024,
+    retries: int = 3,
+    preserve_metadata: bool = True,
+    preserve_xattr: bool = False,
+    checkpoint_interval: int = 10,
+    resume: bool = False
+) -> Tuple[str, float, int, str]:
+    """
+    支持断点续传的流式拷贝
+    
+    返回: (哈希值, 耗时, 拷贝字节数, 错误信息)
+    """
+    source_size = source_path.stat().st_size
+    rel_path = str(source_path.relative_to(checkpoint_manager.source)) if checkpoint_manager else str(source_path)
+    
+    target_size = 0
+    if resume and target_path.exists():
+        target_size = target_path.stat().st_size
+        
+    # 如果目标文件已存在且大小等于源文件，直接返回
+    if target_size == source_size:
+        return "MATCH", 0.0, target_size, ""
+
+    # 如果目标文件大于源文件，可能已经损坏，重头开始
+    if target_size > source_size:
+        target_size = 0
+
+    hash_func = get_hash_func(algorithm)
+    bytes_copied = target_size
+    start_time = time.time()
+    last_error = ""
+    last_checkpoint_time = start_time
+
+    # 如果是续传，需要重新读一遍已存在部分计算哈希
+    if target_size > 0:
+        try:
+            with open(target_path, 'rb') as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk: break
+                    hash_func.update(chunk)
+            mode = 'ab'
+        except Exception as e:
+            last_error = f"无法读取已存在的块: {e}"
+            target_size = 0
+            bytes_copied = 0
+            mode = 'wb'
+    else:
+        mode = 'wb'
+
+    for attempt in range(retries):
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(source_path, 'rb') as src, open(target_path, mode) as tgt:
+                src.seek(bytes_copied)
+                while bytes_copied < source_size:
+                    chunk = src.read(chunk_size)
+                    if not chunk:
+                        break
+                    hash_func.update(chunk)
+                    tgt.write(chunk)
+                    bytes_copied += len(chunk)
+                    
+                    # 更新进度
+                    if progress_manager:
+                        msg = progress_manager.update(len(chunk), bytes_copied)
+                        if msg:
+                            sys.stdout.write(msg)
+                            sys.stdout.flush()
+                    
+                    # 保存检查点
+                    now = time.time()
+                    if checkpoint_manager and now - last_checkpoint_time >= checkpoint_interval:
+                        checkpoint_manager.save_checkpoint(rel_path, bytes_copied)
+                        last_checkpoint_time = now
+
+            if preserve_metadata:
+                try:
+                    shutil.copystat(source_path, target_path)
+                except Exception:
+                    pass
+
+            if preserve_xattr and HAS_XATTR:
+                try:
+                    xattr.copyxattr(source_path, target_path)
+                except Exception:
+                    pass
+
+            return hash_func.hexdigest(), time.time() - start_time, bytes_copied, ""
+        except (OSError, IOError) as e:
+            last_error = str(e)
+            if attempt < retries - 1:
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+            # 在失败时不删除目标文件，以便后续续传
+
+    return "", time.time() - start_time, bytes_copied, last_error
 
 
 def copy_with_streaming_hash(
@@ -303,6 +419,157 @@ def scan_and_compare(source: Path, target: Path, verbose: bool = False) -> dict:
         'source_files': source_files,
         'target_files': target_files
     }
+
+
+def format_time(seconds: float) -> str:
+    """格式化时间"""
+    if seconds >= 3600:
+        return time.strftime("%H:%M:%S", time.gmtime(seconds))
+    else:
+        return time.strftime("%M:%S", time.gmtime(seconds))
+
+
+class ProgressManager:
+    """实时进度显示管理"""
+    
+    def __init__(self, total_size: int, file_name: str, enabled: bool = False):
+        self.total_size = total_size
+        self.copied_size = 0
+        self.file_name = file_name
+        self.start_time = time.time()
+        self.last_update = self.start_time
+        self.enabled = enabled
+        
+    def update(self, bytes_copied: int, current_pos: int = None) -> Optional[str]:
+        """更新进度并返回进度条字符串"""
+        if current_pos is not None:
+            self.copied_size = current_pos
+        else:
+            self.copied_size += bytes_copied
+            
+        if not self.enabled:
+            return None
+            
+        now = time.time()
+        
+        # 每秒最多更新一次显示
+        if now - self.last_update < 1.0 and self.copied_size < self.total_size and bytes_copied > 0:
+            return None
+            
+        self.last_update = now
+        elapsed = now - self.start_time
+        speed = self.copied_size / elapsed if elapsed > 0 else 0
+        
+        # 计算百分比和 ETA
+        percent = (self.copied_size / self.total_size) * 100 if self.total_size > 0 else 100
+        remaining_bytes = self.total_size - self.copied_size
+        eta_seconds = remaining_bytes / speed if speed > 0 else 0
+        
+        # 生成进度条
+        bar_length = 30
+        filled = int(bar_length * percent / 100) if percent < 100 else bar_length
+        bar = '█' * filled + '░' * (bar_length - filled)
+        
+        # [filename] ████████░░ 65% | 7.8 GB / 12 GB | 245 MB/s | ETA: 00:17
+        return f"\r[{self.file_name[:20]:<20}] {bar} {percent:5.1f}% | {format_size(self.copied_size):>8} / {format_size(self.total_size):<8} | {format_speed(self.copied_size, elapsed):>8} | ETA: {format_time(eta_seconds):>6}"
+
+
+class CheckpointManager:
+    """断点续传状态管理"""
+    
+    def __init__(self, source: Path, target: Path, checkpoint_file: Optional[Path] = None):
+        self.source = source
+        self.target = target
+        self.checkpoint_file = checkpoint_file or (target / ".sync-progress.json")
+        self.state = self._load_or_create_state()
+        
+    def _load_or_create_state(self) -> dict:
+        if self.checkpoint_file and self.checkpoint_file.exists():
+            try:
+                with open(self.checkpoint_file, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        
+        return {
+            "session_id": f"sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            "source": str(self.source),
+            "target": str(self.target),
+            "started_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+            "current_file": "",
+            "position": 0,
+            "files": {}
+        }
+    
+    def get_resume_position(self, rel_path: str) -> int:
+        """获取续传位置"""
+        # 如果文件已在 files 中标记为完成，则返回完整大小
+        if rel_path in self.state.get('files', {}):
+            return self.state['files'][rel_path].get('size', 0)
+        
+        # 如果是当前中断的文件，检查实际目标文件大小
+        if self.state.get('current_file') == rel_path:
+            target_file = self.target / rel_path
+            if target_file.exists():
+                return target_file.stat().st_size
+        return 0
+
+    def save_checkpoint(self, current_file: str, position: int):
+        """保存当前进度点"""
+        self.state['current_file'] = current_file
+        self.state['position'] = position
+        self.state['updated_at'] = datetime.now().isoformat()
+        self._write_state()
+        
+    def mark_complete(self, rel_path: str, file_size: int, hash_value: str):
+        """标记文件已完成"""
+        self.state['files'][rel_path] = {
+            'size': file_size,
+            'hash': hash_value,
+            'completed_at': datetime.now().isoformat()
+        }
+        if self.state.get('current_file') == rel_path:
+            self.state['current_file'] = ""
+            self.state['position'] = 0
+        self._write_state()
+        
+    def _write_state(self):
+        try:
+            self.checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.checkpoint_file, 'w') as f:
+                json.dump(self.state, f, indent=2)
+        except Exception:
+            pass
+
+    def cleanup(self):
+        """同步完成后删除进度文件"""
+        if self.checkpoint_file and self.checkpoint_file.exists():
+            try:
+                self.checkpoint_file.unlink()
+            except Exception:
+                pass
+
+
+class SleepDetector:
+    """检测系统休眠并触发恢复流程"""
+    
+    def __init__(self, on_wake_callback: Optional[Callable] = None):
+        self.on_wake_callback = on_wake_callback
+        self.last_timestamp = time.time()
+        
+    def check_time_gap(self) -> bool:
+        """检测时间跳跃（可能休眠）"""
+        now = time.time()
+        gap = now - self.last_timestamp
+        self.last_timestamp = now
+        
+        # 如果超过 60 秒没有更新，可能休眠了
+        if gap > 60:
+            if self.on_wake_callback:
+                self.on_wake_callback(gap)
+            return True
+        return False
 
 
 def format_size(size: int) -> str:
@@ -562,7 +829,11 @@ def sync_single_pair(
     preserve_xattr: bool,
     sidecar: bool,
     retries: int,
-    verbose: bool
+    verbose: bool,
+    show_progress: bool = False,
+    checkpoint_manager: Optional[CheckpointManager] = None,
+    checkpoint_interval: int = 10,
+    resume: bool = False
 ) -> SyncResult:
     """同步单个源-目标对"""
     target.mkdir(parents=True, exist_ok=True)
@@ -570,6 +841,13 @@ def sync_single_pair(
     if verbose:
         print(f"\n🔍 扫描源文件夹: {source}")
     source_files = scan_folder(source, verbose)
+    
+    # 如果是恢复模式，从检查点获取需要跳过的已完成文件
+    completed_files = set()
+    if checkpoint_manager and resume:
+        completed_files = set(checkpoint_manager.state.get('files', {}).keys())
+        if verbose:
+            print(f"📋 恢复模式: 已完成 {len(completed_files)} 个文件将跳过")
 
     result = SyncResult(
         source=source,
@@ -587,9 +865,16 @@ def sync_single_pair(
 
     sorted_files = sorted(source_files.items())
     total_files = len(sorted_files)
+    
+    # 计算需要拷贝的文件数（恢复模式下排除已完成的）
+    files_to_copy = [(rp, sp) for rp, sp in sorted_files if rp not in completed_files]
+    files_to_copy_count = len(files_to_copy)
 
     if verbose:
-        print(f"\n📦 开始拷贝: {total_files} 个文件")
+        if resume and completed_files:
+            print(f"\n📦 开始拷贝: {files_to_copy_count} 个文件 (跳过 {len(completed_files)} 个已完成)")
+        else:
+            print(f"\n📦 开始拷贝: {total_files} 个文件")
         print(f"🔐 哈希算法: {algorithm.upper()}")
         if double_verify:
             print("✓ 双重校验: 已启用")
@@ -599,11 +884,18 @@ def sync_single_pair(
             print("✓ 扩展属性保留: 已启用")
         if sidecar:
             print("✓ 校验码文件: 已启用")
+        if show_progress:
+            print("✓ 实时进度: 已启用")
+        if checkpoint_manager:
+            print(f"✓ 断点续传: 已启用 (每 {checkpoint_interval} 秒保存)")
         print()
 
     stats = {'bytes': 0, 'time': 0}
+    
+    # 初始化进度管理器（如果有）
+    progress_mgr = None
 
-    for idx, (rel_path, source_path) in enumerate(sorted_files, 1):
+    for idx, (rel_path, source_path) in enumerate(files_to_copy, 1):
         target_path = target / rel_path
 
         try:
@@ -615,23 +907,43 @@ def sync_single_pair(
             continue
 
         if verbose:
-            print_progress(idx, total_files, rel_path, stats)
+            print_progress(idx, files_to_copy_count, rel_path, stats)
 
         if target_path.exists() and skip_existing:
             result.skipped.append(rel_path)
             continue
 
-        source_hash, copy_time, bytes_copied, error = copy_with_streaming_hash(
-            source_path, target_path, algorithm,
-            retries=retries,
-            preserve_metadata=preserve_metadata,
-            preserve_xattr=preserve_xattr
-        )
+        # 创建进度管理器（每个文件一个）
+        if checkpoint_manager or show_progress:
+            progress_mgr = ProgressManager(source_size, rel_path, show_progress)
+
+        # 使用带进度和断点续传的拷贝函数
+        if checkpoint_manager or show_progress:
+            source_hash, copy_time, bytes_copied, error = copy_with_resume(
+                source_path, target_path, algorithm,
+                checkpoint_manager=checkpoint_manager,
+                progress_manager=progress_mgr,
+                retries=retries,
+                preserve_metadata=preserve_metadata,
+                preserve_xattr=preserve_xattr,
+                checkpoint_interval=checkpoint_interval,
+                resume=resume
+            )
+        else:
+            source_hash, copy_time, bytes_copied, error = copy_with_streaming_hash(
+                source_path, target_path, algorithm,
+                retries=retries,
+                preserve_metadata=preserve_metadata,
+                preserve_xattr=preserve_xattr
+            )
 
         if error:
             result.failed.append(rel_path)
             if verbose:
                 print(f"\n❌ 拷贝失败: {rel_path} ({error})")
+            # 保存失败前的进度
+            if checkpoint_manager:
+                checkpoint_manager.save_checkpoint(rel_path, bytes_copied)
             continue
 
         file_result = FileResult(
@@ -665,6 +977,10 @@ def sync_single_pair(
         result.copied.append(rel_path)
         result.files.append(file_result)
         result.total_bytes += bytes_copied
+        
+        # 标记文件完成
+        if checkpoint_manager:
+            checkpoint_manager.mark_complete(rel_path, bytes_copied, source_hash)
 
         stats['bytes'] = result.total_bytes
         stats['time'] = result.end_time - result.start_time
@@ -817,10 +1133,55 @@ def run_verify(args, algorithm: str) -> int:
     return 1 if result.failed else 0
 
 
+# Global checkpoint manager for signal handling
+_global_checkpoint = None
+
+def _signal_handler(signum, frame):
+    """Ctrl+C 优雅中断处理"""
+    global _global_checkpoint
+    print("\n\n⚠️ 检测到中断信号，正在保存进度...")
+    if _global_checkpoint:
+        _global_checkpoint.save_checkpoint(_global_checkpoint.state.get('current_file', ''), 
+                                           _global_checkpoint.state.get('position', 0))
+        print(f"✅ 进度已保存到: {_global_checkpoint.checkpoint_file}")
+        print(f"💡 恢复命令: python3 check_sync_pro.py --resume {_global_checkpoint.checkpoint_file}")
+    sys.exit(1)
+
+
 def run_copy(args, algorithm: str) -> int:
     """拷贝模式入口"""
+    global _global_checkpoint
+    
     source, target = validate_paths(args)
-
+    
+    # 初始化进度和检查点管理器
+    checkpoint_manager = None
+    progress_manager = None
+    should_resume = False
+    
+    if args.resume:
+        # 从进度文件恢复
+        resume_file = Path(args.resume)
+        if resume_file.exists():
+            checkpoint_manager = CheckpointManager(source, target, resume_file)
+            # 从状态中恢复当前文件
+            state = checkpoint_manager.state
+            if state.get('current_file') or state.get('files'):
+                should_resume = True
+                print(f"🔄 检测到进度文件，将从断点继续...")
+                if state.get('current_file'):
+                    print(f"  继续文件: {state['current_file']} ({format_size(state.get('position', 0))})")
+        else:
+            print(f"⚠️ 进度文件不存在: {resume_file}")
+    elif args.progress:
+        # 启用进度显示，创建空的检查点管理器
+        checkpoint_manager = CheckpointManager(source, target)
+    
+    if checkpoint_manager:
+        _global_checkpoint = checkpoint_manager
+        # 设置信号处理
+        signal.signal(signal.SIGINT, _signal_handler)
+    
     result = sync_single_pair(
         source=source,
         target=target,
@@ -831,11 +1192,20 @@ def run_copy(args, algorithm: str) -> int:
         preserve_xattr=args.preserve_xattr,
         sidecar=args.sidecar,
         retries=args.retries,
-        verbose=args.verbose
+        verbose=args.verbose,
+        show_progress=args.progress,
+        checkpoint_manager=checkpoint_manager,
+        checkpoint_interval=args.checkpoint,
+        resume=should_resume
     )
 
     result.project_name = args.project_name or target.name
     print_result_summary(result, args.verbose, Mode.COPY)
+    
+    # 清理检查点文件（拷贝完成）
+    if checkpoint_manager:
+        checkpoint_manager.cleanup()
+        _global_checkpoint = None
 
     if args.report:
         report_data = generate_report(result)
@@ -1036,11 +1406,21 @@ def parse_args() -> argparse.Namespace:
       --double-verify --mhl --sidecar --preserve-xattr \\
       --report report.json --verbose
 
+  # 启用实时进度条(拷贝大文件时推荐)
+  %(prog)s /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 --progress
+
+  # 从断点恢复拷贝
+  %(prog)s --resume .sync-progress.json
+
+  # 启用断点续传+进度显示+每5秒保存进度
+  %(prog)s /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 --progress --checkpoint 5
+
 注意:
   - 默认使用 xxHash 算法(需安装: pip install xxhash)
   - 如未安装 xxhash,自动回退到 MD5
   - 双重校验会增加约 30%% 时间,但提供更高安全性
   - MHL 报告可被 Silverstack、YoYotta、DaVinci Resolve 等软件识别
+  - 断点续传在拷贝大文件时非常有用，笔记本休眠后可以从断点继续
 """
     )
 
@@ -1097,6 +1477,14 @@ def parse_args() -> argparse.Namespace:
                         help="显示详细进度")
     parser.add_argument("--verify", action="store_true",
                         help="校验模式:仅校验目标文件夹中已存在的文件,不拷贝新文件")
+
+    # 断点续传参数
+    parser.add_argument("--progress", action="store_true",
+                        help="显示实时进度条(大文件拷贝时推荐)")
+    parser.add_argument("--resume", metavar="FILE",
+                        help="从进度文件恢复拷贝(.sync-progress.json)")
+    parser.add_argument("--checkpoint", type=int, default=10, metavar="N",
+                        help="每 N 秒保存进度(默认: 10)")
 
     return parser.parse_args()
 
