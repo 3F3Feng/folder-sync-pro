@@ -28,17 +28,22 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pytest xxhash
+        pip install pytest xxhash xattr
 
     - name: Run tests
       run: |
         cd tests
         pytest test_check_sync_pro.py -v --tb=short
 
-    - name: Test basic functionality
+    - name: Test MHL generation
       run: |
-        python3 check_sync_pro.py --help
+        # Quick test of MHL and sidecar features
+        python3 check_sync_pro.py --help | grep -q "--mhl"
+        python3 check_sync_pro.py --help | grep -q "--sidecar"
+        echo "MHL and sidecar features available"
 
-    - name: Verify script is executable
+    - name: Test multi-source mode
       run: |
-        python3 -c "import check_sync_pro; print('Module imported successfully')"
+        python3 check_sync_pro.py --help | grep -q "--sources"
+        python3 check_sync_pro.py --help | grep -q "--targets"
+        echo "Multi-source mode available"

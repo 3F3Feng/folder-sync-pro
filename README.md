@@ -5,10 +5,10 @@
 ## 简介 / Introduction
 
 **中文：**
-Folder Sync Pro 是专为摄影师和视频制作团队设计的拷卡校验工具。采用流式哈希技术，在拷贝过程中同时计算哈希值，无需二次读取源文件，既保证了数据安全，又不影响拷贝速度。
+Folder Sync Pro 是专为摄影师和视频制作团队设计的拷卡校验工具。采用流式哈希技术，在拷贝过程中同时计算哈希值，无需二次读取源文件，既保证了数据安全，又不影响拷贝速度。支持专业 DIT 工作流程，包括 MHL 报告、校验码文件、多源拷贝等。
 
 **English:**
-Folder Sync Pro is a professional media offload verification tool designed for photographers and video production teams. Using streaming hash technology, it calculates hash values during copy, eliminating the need to read source files twice—ensuring data safety without compromising speed.
+Folder Sync Pro is a professional media offload verification tool designed for photographers and video production teams. Using streaming hash technology, it calculates hash values during copy, eliminating the need to read source files twice—ensuring data safety without compromising speed. Supports professional DIT workflows including MHL reports, sidecar hash files, and multi-source copy.
 
 ## 特性 / Features
 
@@ -18,6 +18,13 @@ Folder Sync Pro is a professional media offload verification tool designed for p
 - 📊 **详细报告** - JSON 格式完整校验报告
 - ⚡ **xxHash 支持** - 比 MD5 快 10 倍
 - 🧵 **多线程** - 可配置并发线程数
+
+### 专业 DIT 功能
+
+- 📋 **MHL 报告** - 生成 ASC MHL v1.1 标准校验报告（Silverstack、YoYotta、DaVinci Resolve 兼容）
+- 🔐 **校验码文件** - 生成 .xxhash/.md5 伴随文件
+- 🔁 **多源拷贝** - 多张存储卡同时拷贝到多个目标
+- ⏰ **元数据保留** - 完整保留文件时间戳和扩展属性
 
 ## 安装 / Installation
 
@@ -34,6 +41,11 @@ pip install xxhash
 
 安装 xxhash 后，默认使用 xxHash 算法，速度提升约 10 倍。
 
+### 可选：安装 xattr（用于扩展属性）
+```bash
+pip install xattr
+```
+
 ## 使用方法 / Usage
 
 ### 基本使用
@@ -48,10 +60,64 @@ python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01
 python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 --double-verify
 ```
 
-### 生成详细报告
+### 生成 MHL 报告（影视行业标准）
 ```bash
-# 生成 JSON 格式校验报告
-python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 --report report.json
+# 生成 ASC MHL v1.1 标准校验报告
+python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 --mhl
+
+# 指定项目名称
+python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 --mhl --project-name "MyProject"
+
+# 指定 MHL 输出路径
+python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 --mhl --mhl-output ~/Reports/project.mhl
+```
+
+### 生成校验码伴随文件
+```bash
+# 为每个文件生成 .xxhash 伴随文件
+python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 --sidecar
+
+# 使用 MD5 格式
+python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 --sidecar --hash md5
+```
+
+### 多源拷贝（多卡备份）
+```bash
+# 从两张卡拷贝到两个备份盘（串行）
+python3 check_sync_pro.py \
+  --sources /Volumes/SD_CARD1 /Volumes/SD_CARD2 \
+  --targets /Volumes/Backup1 /Volumes/Backup2
+
+# 并行拷贝（2个并发任务）
+python3 check_sync_pro.py \
+  --sources /Volumes/SD_CARD1 /Volumes/SD_CARD2 \
+  --targets /Volumes/Backup1 /Volumes/Backup2 \
+  --parallel 2 \
+  --mhl
+
+# 完整专业模式
+python3 check_sync_pro.py \
+  --sources /Volumes/SD_CARD1 /Volumes/SD_CARD2 \
+  --targets /Volumes/Backup1 /Volumes/Backup2 \
+  --parallel 2 \
+  --double-verify \
+  --mhl \
+  --sidecar \
+  --preserve-xattr \
+  --report report.json \
+  --verbose
+```
+
+### 元数据保留
+```bash
+# 保留文件时间戳（默认启用）
+python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 --preserve-metadata
+
+# 禁用时间戳保留
+python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 --no-preserve-metadata
+
+# 保留扩展属性（macOS 标签等，需要 xattr 模块）
+python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 --preserve-xattr
 ```
 
 ### 仅校验已有文件
@@ -71,23 +137,120 @@ python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 \
   --hash xxhash \
   --threads 4 \
   --report report.json \
+  --mhl \
+  --sidecar \
+  --preserve-xattr \
   --verbose
 ```
 
 ## 命令行参数 / Command Line Arguments
 
+### 基本参数
+
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `source` | 源文件夹路径（存储卡） | 必需 |
 | `target` | 目标文件夹路径 | 必需 |
+
+### 多源拷贝参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--sources PATH...` | 多个源文件夹路径 | 无 |
+| `--targets PATH...` | 多个目标文件夹路径 | 无 |
+| `--parallel N` | 并发拷贝数 | 1 |
+
+### 校验参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
 | `--double-verify` | 二次校验模式：拷贝后再读一遍目标文件验证 | 否 |
 | `--retries N` | IO 错误重试次数 | 3 |
-| `--report FILE` | 生成详细 JSON 报告 | 无 |
-| `--hash ALG` | 哈希算法（xxhash/md5/sha256） | xxhash 或 md5 |
-| `--threads N` | 并发线程数 | 4 |
 | `--verify` | 校验模式：仅校验目标文件夹中已存在的文件，不拷贝新文件 | 否 |
+
+### 输出参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--report FILE` | 生成详细 JSON 报告 | 无 |
+| `--mhl` | 生成 ASC MHL v1.1 标准校验报告 | 否 |
+| `--mhl-output FILE` | MHL 报告输出路径 | 自动生成 |
+| `--project-name NAME` | 项目名称（用于 MHL 报告） | 目标文件夹名 |
+| `--sidecar` | 生成校验码伴随文件(.xxhash 或 .md5) | 否 |
+
+### 哈希参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--hash ALG` | 哈希算法（xxhash/md5/sha256） | xxhash 或 md5 |
+
+### 拷贝参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--threads N` | 并发线程数 | 4 |
 | `--skip-existing` | 跳过已存在的文件 | 否 |
+
+### 元数据参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--preserve-metadata` | 保留文件时间戳 | 是 |
+| `--no-preserve-metadata` | 不保留文件时间戳 | 否 |
+| `--preserve-xattr` | 保留文件扩展属性（需要 xattr 模块） | 否 |
+
+### 其他参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
 | `--verbose` `-v` | 显示详细进度 | 否 |
+
+## MHL 报告格式 / MHL Report Format
+
+MHL (Media Hash List) 是影视行业标准的校验报告格式，可被以下软件识别：
+- Silverstack
+- YoYotta
+- DaVinci Resolve
+- 其他支持 ASC MHL 的软件
+
+### MHL 文件示例
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<hashlist version="1.1">
+  <creatorinfo>
+    <name>Folder Sync Pro</name>
+    <version>1.0.0</version>
+    <hostname>MacBook-Pro</hostname>
+    <tool>check_sync_pro.py</tool>
+    <startdate>2024-01-15T10:30:00Z</startdate>
+    <finishdate>2024-01-15T10:45:00Z</finishdate>
+  </creatorinfo>
+  <hash>
+    <file>A001_C001_0115AB/Contents/Clip001.mxf</file>
+    <size>1073741824</size>
+    <xxhash64>a1b2c3d4e5f67890</xxhash64>
+    <hashdate>2024-01-15T10:31:00Z</hashdate>
+  </hash>
+</hashlist>
+```
+
+### 使用 MHL 的工作流程
+1. 拷贝完成后生成 MHL 报告
+2. 将 MHL 文件与素材一起保存
+3. 在后期软件中导入 MHL 验证素材完整性
+
+## 校验码文件格式 / Sidecar Hash File Format
+
+每个文件生成对应的哈希伴随文件：
+
+| 原文件 | 伴随文件 (xxhash) | 伴随文件 (md5) |
+|--------|-------------------|----------------|
+| `Clip001.mxf` | `Clip001.mxf.xxhash` | `Clip001.mxf.md5` |
+
+伴随文件内容示例：
+```
+a1b2c3d4e5f67890
+```
 
 ## 技术原理 / Technical Principles
 
@@ -120,6 +283,13 @@ python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 \
 - 第 3 次重试：等待 4 秒
 
 重试前会清理不完整的目标文件，避免残留损坏数据。
+
+### 多源拷贝
+多源拷贝支持从多张存储卡同时拷贝到多个目标：
+- **串行模式**（默认）：依次处理每个源-目标对
+- **并行模式**（`--parallel N`）：同时处理 N 个任务
+
+示例：2 张卡 → 2 个备份盘 = 4 个拷贝任务
 
 ## 安全机制 / Safety Mechanisms
 
@@ -159,6 +329,7 @@ python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 \
 
 ## 输出示例 / Output Example
 
+### 单源拷贝
 ```
 ==================================================
 📊 拷贝完成
@@ -177,10 +348,37 @@ python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 \
 ✓ 双重校验: 已完成
 
 📄 JSON 报告已保存: report.json
+📄 MHL 报告已保存: 2024-01-01_20240115103000.mhl
+```
+
+### 多源拷贝
+```
+============================================================
+📊 多源拷贝完成
+============================================================
+
+总任务数: 4
+✅ 成功拷贝: 512 个文件
+⏭️  跳过文件: 0 个文件
+❌ 失败文件: 0 个文件
+
+📦 总数据量: 90.4 GB
+⏱️  总耗时: 765.0 秒
+🚀 平均速度: 120.5 MB/s
+
+各任务详情:
+  ✅ SD_CARD1 → Backup1: 256 成功, 0 失败
+  ✅ SD_CARD1 → Backup2: 256 成功, 0 失败
+  ✅ SD_CARD2 → Backup1: 256 成功, 0 失败
+  ✅ SD_CARD2 → Backup2: 256 成功, 0 失败
+
+📄 MHL 报告已保存: Backup1/MyProject_20240115103000.mhl
+📄 MHL 报告已保存: Backup2/MyProject_20240115103000.mhl
 ```
 
 ## JSON 报告格式 / JSON Report Format
 
+### 单源报告
 ```json
 {
   "metadata": {
@@ -188,7 +386,9 @@ python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 \
     "version": "1.0.0",
     "timestamp": "2024-01-15T10:30:00Z",
     "algorithm": "xxhash",
-    "double_verify": true
+    "double_verify": true,
+    "source": "/Volumes/SD_CARD/DCIM",
+    "target": "/Users/photographer/Photos/2024-01-01"
   },
   "summary": {
     "total_files": 256,
@@ -215,10 +415,37 @@ python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 \
 }
 ```
 
+### 多源报告
+```json
+{
+  "metadata": {
+    "tool": "Folder Sync Pro",
+    "version": "1.0.0",
+    "timestamp": "2024-01-15T10:30:00Z",
+    "algorithm": "xxhash",
+    "sources": ["/Volumes/SD_CARD1", "/Volumes/SD_CARD2"],
+    "targets": ["/Volumes/Backup1", "/Volumes/Backup2"],
+    "multi_source": true
+  },
+  "summary": {
+    "total_tasks": 4,
+    "total_copied": 512,
+    "total_failed": 0,
+    "total_skipped": 0,
+    "total_bytes": 97000000000,
+    "total_size": "90.4 GB",
+    "duration_seconds": 765.0
+  },
+  "tasks": [...]
+}
+```
+
 ## 系统要求 / Requirements
 
 - Python 3.9+
 - 操作系统：macOS / Linux / Windows
+- 可选：xxhash（提升速度）
+- 可选：xattr（扩展属性保留，macOS）
 
 ## 许可证 / License
 

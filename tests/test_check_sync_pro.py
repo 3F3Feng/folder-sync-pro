@@ -397,3 +397,334 @@ class TestFormatFunctions:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestMHLSidecarGeneration:
+    """Test MHL report and sidecar hash file generation"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        """Create temporary directories"""
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_generate_sidecar_xxhash(self, temp_dirs):
+        """Test generating xxhash sidecar file"""
+        source, target = temp_dirs
+        test_file = source / "test.txt"
+        test_file.write_bytes(b"Hello, World!")
+        
+        # Compute hash
+        hash_value = sync_pro.compute_hash(b"Hello, World!", "xxhash")
+        
+        # Generate sidecar file
+        sidecar_path = sync_pro.generate_sidecar_hash_file(test_file, hash_value, "xxhash", target)
+        
+        assert sidecar_path is not None
+        assert sidecar_path.exists()
+        assert sidecar_path.name == "test.txt.xxhash"
+        assert sidecar_path.read_text().strip() == hash_value
+
+    def test_generate_sidecar_md5(self, temp_dirs):
+        """Test generating MD5 sidecar file"""
+        source, target = temp_dirs
+        test_file = source / "test.txt"
+        test_file.write_bytes(b"Hello, World!")
+        
+        # Compute hash
+        hash_value = sync_pro.compute_hash(b"Hello, World!", "md5")
+        
+        # Generate sidecar file
+        sidecar_path = sync_pro.generate_sidecar_hash_file(test_file, hash_value, "md5", target)
+        
+        assert sidecar_path is not None
+        assert sidecar_path.exists()
+        assert sidecar_path.name == "test.txt.md5"
+        assert sidecar_path.read_text().strip() == hash_value
+
+    def test_generate_mhl_report(self, temp_dirs):
+        """Test generating MHL report"""
+        source, target = temp_dirs
+        
+        # Create test files
+        (source / "file1.txt").write_bytes(b"Content 1")
+        (source / "file2.txt").write_bytes(b"Content 2")
+        
+        # Copy files and collect results
+        result = sync_pro.SyncResult(
+            source=source,
+            target=target,
+            algorithm="xxhash",
+            project_name="TestProject",
+            start_time=100.0,
+            end_time=200.0
+        )
+        
+        # Add file results
+        for i, fname in enumerate(["file1.txt", "file2.txt"]):
+            src_path = source / fname
+            content = src_path.read_bytes()
+            hash_value = sync_pro.compute_hash(content, "xxhash")
+            
+            file_result = sync_pro.FileResult(
+                relative_path=fname,
+                source_size=len(content),
+                target_size=len(content),
+                source_hash=hash_value,
+                success=True,
+                hash_date=sync_pro.datetime.now(sync_pro.timezone.utc)
+            )
+            result.files.append(file_result)
+            result.copied.append(fname)
+        
+        result.total_bytes = sum(f.target_size for f in result.files)
+        
+        # Generate MHL report
+        mhl_path = sync_pro.generate_mhl_report(result)
+        
+        assert mhl_path is not None
+        assert mhl_path.exists()
+        
+        # Parse and verify MHL content - note: minidom formats XML differently
+        content = mhl_path.read_text()
+        assert '<?xml version="1.0"' in content
+        assert '<hashlist version="1.1">' in content
+        assert '<creatorinfo>' in content
+        assert '<name>Folder Sync Pro</name>' in content
+        assert '<xxhash64>' in content  # Using xxhash64 tag
+        assert 'file1.txt' in content
+        assert 'file2.txt' in content
+
+    def test_mhl_contains_hash_dates(self, temp_dirs):
+        """Test MHL report contains hash dates"""
+        source, target = temp_dirs
+        
+        test_file = source / "test.txt"
+        test_file.write_bytes(b"Test content")
+        
+        result = sync_pro.SyncResult(
+            source=source,
+            target=target,
+            algorithm="md5",
+            project_name="Test",
+            start_time=100.0,
+            end_time=200.0
+        )
+        
+        content = test_file.read_bytes()
+        hash_value = sync_pro.compute_hash(content, "md5")
+        
+        result.files.append(sync_pro.FileResult(
+            relative_path="test.txt",
+            source_size=len(content),
+            target_size=len(content),
+            source_hash=hash_value,
+            success=True,
+            hash_date=sync_pro.datetime(2024, 1, 15, 10, 30, tzinfo=sync_pro.timezone.utc)
+        ))
+        result.copied.append("test.txt")
+        result.total_bytes = len(content)
+        
+        mhl_path = sync_pro.generate_mhl_report(result)
+        content = mhl_path.read_text()
+        
+        assert '<hashdate>' in content
+
+
+class TestMetadataPreservation:
+    """Test metadata preservation functionality"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        """Create temporary directories"""
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_copystat_preserves_time(self, temp_dirs):
+        """Test that shutil.copystat preserves timestamps"""
+        source, target = temp_dirs
+        
+        test_file = source / "test.txt"
+        test_file.write_bytes(b"Test content")
+        
+        # Get original timestamps
+        original_stat = test_file.stat()
+        original_mtime = original_stat.st_mtime
+        
+        # Copy with hash (which calls copystat internally)
+        target_file = target / "test.txt"
+        sync_pro.copy_with_streaming_hash(test_file, target_file, "md5", preserve_metadata=True)
+        
+        # Check timestamps are preserved
+        assert target_file.exists()
+        new_stat = target_file.stat()
+        
+        # Allow 1 second tolerance for filesystem timestamp precision
+        assert abs(new_stat.st_mtime - original_mtime) < 1
+
+    def test_no_preserve_metadata(self, temp_dirs):
+        """Test copying without preserving metadata"""
+        source, target = temp_dirs
+        
+        test_file = source / "test.txt"
+        test_file.write_bytes(b"Test content")
+        
+        target_file = target / "test.txt"
+        sync_pro.copy_with_streaming_hash(test_file, target_file, "md5", preserve_metadata=False)
+        
+        assert target_file.exists()
+
+
+class TestMultiSourceCopy:
+    """Test multi-source copy functionality"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        """Create multiple temporary directories"""
+        sources = [Path(tempfile.mkdtemp()) for _ in range(2)]
+        targets = [Path(tempfile.mkdtemp()) for _ in range(2)]
+        yield sources, targets
+        for d in sources + targets:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_multi_source_result_dataclass(self):
+        """Test MultiSourceResult dataclass"""
+        sources = [Path("/src1"), Path("/src2")]
+        targets = [Path("/tgt1"), Path("/tgt2")]
+        
+        result = sync_pro.MultiSourceResult(
+            sources=sources,
+            targets=targets,
+            start_time=100.0
+        )
+        
+        assert len(result.sources) == 2
+        assert len(result.targets) == 2
+        assert result.start_time == 100.0
+        assert result.results == []
+
+    def test_sync_single_pair_returns_syncresult(self, temp_dirs):
+        """Test sync_single_pair returns proper SyncResult"""
+        sources, targets = temp_dirs
+        
+        # Create test files in source
+        (sources[0] / "test.txt").write_bytes(b"Test content")
+        
+        result = sync_pro.sync_single_pair(
+            source=sources[0],
+            target=targets[0],
+            algorithm="md5",
+            double_verify=False,
+            skip_existing=False,
+            preserve_metadata=False,
+            preserve_xattr=False,
+            sidecar=False,
+            retries=1,
+            verbose=False
+        )
+        
+        assert isinstance(result, sync_pro.SyncResult)
+        assert result.source == sources[0]
+        assert result.target == targets[0]
+        assert len(result.copied) == 1
+        assert result.copied[0] == "test.txt"
+
+    def test_sidecar_generation_during_copy(self, temp_dirs):
+        """Test sidecar files are generated during copy"""
+        sources, targets = temp_dirs
+        
+        # Create test files
+        (sources[0] / "test.txt").write_bytes(b"Test content")
+        
+        result = sync_pro.sync_single_pair(
+            source=sources[0],
+            target=targets[0],
+            algorithm="xxhash",
+            double_verify=False,
+            skip_existing=False,
+            preserve_metadata=False,
+            preserve_xattr=False,
+            sidecar=True,  # Enable sidecar
+            retries=1,
+            verbose=False
+        )
+        
+        # Check sidecar file exists
+        sidecar_file = targets[0] / "test.txt.xxhash"
+        assert sidecar_file.exists()
+        assert len(sidecar_file.read_text().strip()) > 0
+
+
+class TestScanFolderSkipsSidecar:
+    """Test that scan_folder skips sidecar files"""
+
+    def test_scan_skips_xxhash_files(self):
+        """Test that scan_folder skips .xxhash files"""
+        temp_dir = Path(tempfile.mkdtemp())
+        try:
+            # Create normal files and sidecar files
+            (temp_dir / "test.txt").write_bytes(b"content")
+            (temp_dir / "test.txt.xxhash").write_text("hash123")
+            (temp_dir / "test.txt.md5").write_text("hash456")
+            (temp_dir / "subdir").mkdir()
+            (temp_dir / "subdir" / "nested.txt").write_bytes(b"nested")
+            
+            files = sync_pro.scan_folder(temp_dir)
+            
+            # Should only include actual content files
+            assert len(files) == 2
+            assert "test.txt" in files
+            assert "subdir/nested.txt" in files
+            # Should NOT include sidecar files
+            assert "test.txt.xxhash" not in files
+            assert "test.txt.md5" not in files
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+class TestProjectNameInMHL:
+    """Test project name handling in MHL reports"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        """Create temporary directories"""
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_project_name_from_args(self, temp_dirs):
+        """Test project name can be set from args"""
+        source, target = temp_dirs
+        
+        test_file = source / "test.txt"
+        test_file.write_bytes(b"Test")
+        
+        result = sync_pro.sync_single_pair(
+            source=source,
+            target=target,
+            algorithm="md5",
+            double_verify=False,
+            skip_existing=False,
+            preserve_metadata=False,
+            preserve_xattr=False,
+            sidecar=False,
+            retries=1,
+            verbose=False
+        )
+        
+        # Manually set project name (as main() would)
+        result.project_name = "MyCustomProject"
+        
+        # Generate MHL
+        mhl_path = sync_pro.generate_mhl_report(result)
+        
+        # MHL filename should contain project name
+        assert "MyCustomProject" in mhl_path.name
