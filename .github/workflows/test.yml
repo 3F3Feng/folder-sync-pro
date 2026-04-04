@@ -38,12 +38,12 @@ jobs:
     - name: Test MHL generation
       run: |
         # Quick test of MHL and sidecar features
-        python3 check_sync_pro.py --help | grep -q "--mhl"
-        python3 check_sync_pro.py --help | grep -q "--sidecar"
+        python3 check_sync_pro.py --help | grep -q "\-\-mhl"
+        python3 check_sync_pro.py --help | grep -q "\-\-sidecar"
         echo "MHL and sidecar features available"
 
     - name: Test multi-source mode
       run: |
-        python3 check_sync_pro.py --help | grep -q "--sources"
-        python3 check_sync_pro.py --help | grep -q "--targets"
+        python3 check_sync_pro.py --help | grep -q "\-\-sources"
+        python3 check_sync_pro.py --help | grep -q "\-\-targets"
         echo "Multi-source mode available"
