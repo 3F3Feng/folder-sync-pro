@@ -190,7 +190,7 @@ def _copy_and_hash_file(
     preserve_metadata: bool = True,
     preserve_xattr: bool = False,
     checkpoint_manager: Optional[CheckpointManager] = None,
-    progress_manager: Optional[ProgressManager] = None,
+    progress_callback: Optional[Callable[[int], None]] = None,
     resume: bool = False,
 ) -> Tuple[str, float, int, str]:
     """
@@ -274,11 +274,8 @@ def _copy_and_hash_file(
                     tgt.write(chunk)
                     bytes_copied += len(chunk)
                     
-                    if progress_manager:
-                        msg = progress_manager.update(len(chunk))
-                        if msg:
-                            sys.stdout.write(msg)
-                            sys.stdout.flush()
+                    if progress_callback:
+                        progress_callback(bytes_copied)
                     
                     now = time.time()
                     if checkpoint_manager and now - last_checkpoint_time > checkpoint_manager.interval:
@@ -435,62 +432,77 @@ def format_time(seconds: float) -> str:
 
 
 class ProgressManager:
-    """实时进度显示管理"""
+    """双行进度显示管理器（总进度 + 当前文件进度）"""
     
-    def __init__(self, total_size: int, file_name: str, enabled: bool = False):
-        self.total_size = total_size
-        self.copied_size = 0
-        self.file_name = file_name
+    def __init__(self, total_files: int, total_bytes: int, enabled: bool = True):
+        self.total_files = total_files
+        self.total_bytes = total_bytes
+        self.completed_files = 0
+        self.completed_bytes = 0
+        self.current_file = ""
+        self.current_file_size = 0
+        self.current_file_copied = 0
         self.start_time = time.time()
+        self.file_start_time = self.start_time
         self.last_update = self.start_time
         self.enabled = enabled
         self.terminal_width = shutil.get_terminal_size((80, 20)).columns
-        self.last_update_bytes = 0
         
-    def update(self, bytes_copied: int, current_pos: int = None) -> Optional[str]:
-        """更新进度并返回进度条字符串"""
-        if current_pos is not None:
-            self.copied_size = current_pos
-        else:
-            self.copied_size += bytes_copied
-            
+    def start_file(self, filename: str, file_size: int):
+        self.current_file = filename
+        self.current_file_size = file_size
+        self.current_file_copied = 0
+        self.file_start_time = time.time()
+        
+    def update_file_progress(self, bytes_copied: int):
+        self.current_file_copied = bytes_copied
+        self._render()
+        
+    def complete_file(self, file_size: int):
+        self.completed_files += 1
+        self.completed_bytes += file_size
+        self.current_file_copied = file_size
+        self._render()
+        
+    def _render(self):
         if not self.enabled:
-            return None
-            
+            return
         now = time.time()
-        
-        # 每秒最多更新四次显示
-        if now - self.last_update < 0.25 and self.copied_size < self.total_size:
-            return None
-
-        elapsed_since_last_update = now - self.last_update
-        bytes_since_last_update = self.copied_size - self.last_update_bytes
-        
-        realtime_speed = bytes_since_last_update / elapsed_since_last_update if elapsed_since_last_update > 0 else 0
-
-        # Update for next iteration
+        if now - self.last_update < 0.25 and self.current_file_copied < self.current_file_size:
+            return
         self.last_update = now
-        self.last_update_bytes = self.copied_size
         
-        # 计算百分比和 ETA
-        percent = (self.copied_size / self.total_size) * 100 if self.total_size > 0 else 100
-        remaining_bytes = self.total_size - self.copied_size
-        eta_seconds = remaining_bytes / realtime_speed if realtime_speed > 0 else 0
+        total_pct = (self.completed_bytes / self.total_bytes * 100) if self.total_bytes > 0 else 100
+        file_pct = (self.current_file_copied / self.current_file_size * 100) if self.current_file_size > 0 else 100
         
-        # 生成进度条
-        bar_length = 30
-        filled = int(bar_length * percent / 100) if percent < 100 else bar_length
-        bar = '█' * filled + '░' * (bar_length - filled)
+        elapsed = now - self.start_time
+        avg_speed = self.completed_bytes / elapsed if elapsed > 0 else 0
+        remaining_bytes = self.total_bytes - self.completed_bytes
+        total_eta = remaining_bytes / avg_speed if avg_speed > 0 else 0
         
-        # Use realtime speed for display and ETA
-        speed_str = format_speed(bytes_since_last_update, elapsed_since_last_update)
+        file_elapsed = now - self.file_start_time
+        file_speed = self.current_file_copied / file_elapsed if file_elapsed > 0 else 0
+        remaining_file_bytes = self.current_file_size - self.current_file_copied
+        file_eta = remaining_file_bytes / file_speed if file_speed > 0 else 0
         
-        progress_msg = f"[{self.file_name[:30]:<30}] {bar} {percent:5.1f}% | {format_size(self.copied_size):>8} / {format_size(self.total_size):<8} | {speed_str:>10} | ETA: {format_time(eta_seconds):>6}"
-
-        if self.copied_size >= self.total_size:
-            return f"\r{''.ljust(self.terminal_width)}\r"
-
-        return f"\r{progress_msg.ljust(self.terminal_width)}"
+        total_bar = self._make_bar(total_pct, 20)
+        file_bar = self._make_bar(file_pct, 20)
+        
+        if self.terminal_width >= 100:
+            line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files) + " | " + format_size(self.completed_bytes) + "/" + format_size(self.total_bytes) + " | " + format_speed(self.completed_bytes, elapsed) + " | ETA: " + format_time(total_eta)
+            line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + self.current_file[:25].ljust(25) + " | " + format_size(self.current_file_copied) + "/" + format_size(self.current_file_size) + " | ETA: " + format_time(file_eta)
+        else:
+            line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files) + " | " + format_speed(self.completed_bytes, elapsed)
+            line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + self.current_file[:20].ljust(20)
+        
+        # Use ANSI cursor control: move up 2 lines, clear lines, print new content
+        output = chr(27) + "[2A" + chr(27) + "[K" + line1 + chr(10) + chr(27) + "[K" + line2 + chr(10)
+        sys.stdout.write(output)
+        sys.stdout.flush()
+        
+    def _make_bar(self, pct: float, length: int) -> str:
+        filled = int(length * pct / 100)
+        return chr(9608) * filled + chr(9601) * (length - filled)
 
 
 class CheckpointManager:
