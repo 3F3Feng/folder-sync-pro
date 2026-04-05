@@ -797,7 +797,7 @@ class TestCopyWithResume:
             source_file, target_file, "md5", resume=True
         )
         
-        assert hash_val == "MATCH"
+        import hashlib; expected_hash = hashlib.md5(test_data).hexdigest(); assert hash_val == expected_hash
 
     def test_copy_resume_with_progress(self, temp_dirs):
         """Test copy_with_resume with progress manager"""

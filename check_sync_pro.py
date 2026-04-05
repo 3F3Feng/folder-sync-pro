@@ -206,9 +206,25 @@ def copy_with_resume(
     if resume and target_path.exists():
         target_size = target_path.stat().st_size
         
-    # 如果目标文件已存在且大小等于源文件，直接返回
+    # 如果目标文件已存在且大小等于源文件，计算哈希值
     if target_size == source_size:
-        return "MATCH", 0.0, target_size, ""
+        # 文件已完整存在，计算哈希值
+        print(f"✅ 文件已完整存在，计算哈希值...")
+        hash_func = get_hash_func(algorithm)
+        verified = 0
+        with open(target_path, 'rb') as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                hash_func.update(chunk)
+                verified += len(chunk)
+                # 显示进度
+                if verified % (1024 * 1024 * 1024) < chunk_size:
+                    pct = verified * 100 // source_size
+                    print(f"\r   哈希进度: {pct}%", end='', flush=True)
+        print()
+        return hash_func.hexdigest(), 0.0, target_size, ""
 
     # 如果目标文件大于源文件，可能已经损坏，重头开始
     if target_size > source_size:
