@@ -222,12 +222,22 @@ def copy_with_resume(
 
     # 如果是续传，需要重新读一遍已存在部分计算哈希
     if target_size > 0:
+        # 显示验证进度，避免用户以为卡住
+        print(f"🔄 验证已存在部分: {format_size(target_size)}")
+        verified = 0
         try:
             with open(target_path, 'rb') as f:
                 while True:
                     chunk = f.read(chunk_size)
                     if not chunk: break
                     hash_func.update(chunk)
+                    verified += len(chunk)
+                    # 每1GB显示一次进度
+                    if verified % (1024 * 1024 * 1024) < chunk_size:
+                        pct = verified * 100 // target_size
+                        print(f"\r   验证进度: {pct}% ({format_size(verified)}/{format_size(target_size)})", end='', flush=True)
+            print()  # 换行
+            print(f"💾 从断点继续拷贝...")
             mode = 'ab'
         except Exception as e:
             last_error = f"无法读取已存在的块: {e}"
@@ -348,7 +358,9 @@ def verify_file_hash(
     file_path: Path,
     algorithm: str,
     expected_hash: str,
-    retries: int = 3
+    retries: int = 3,
+    file_name: str = "",
+    total_size: int = 0
 ) -> Tuple[bool, str, str]:
     """
     校验文件哈希值
@@ -356,6 +368,7 @@ def verify_file_hash(
     返回: (是否匹配, 实际哈希, 错误信息)
     """
     last_error = ""
+    bytes_read = 0
     for attempt in range(retries):
         try:
             hash_func = get_hash_func(algorithm)
@@ -365,6 +378,14 @@ def verify_file_hash(
                     if not chunk:
                         break
                     hash_func.update(chunk)
+                    bytes_read += len(chunk)
+                    # 每1GB显示一次进度(仅在提供大小时)
+                    if total_size > 0 and bytes_read % (1024 * 1024 * 1024) < (1024 * 1024):
+                        pct = bytes_read * 100 // total_size
+                        name = file_name[:30] if file_name else file_path.name
+                        print(f"\r🔍 双重校验: {name} ({format_size(total_size)})", end='', flush=True)
+                        print(f"\n  校验进度: {pct}% ({format_size(bytes_read)} / {format_size(total_size)})", end='', flush=True)
+            print()  # 换行
             actual_hash = hash_func.hexdigest()
             return actual_hash == expected_hash, actual_hash, ""
         except (OSError, IOError) as e:
@@ -471,7 +492,7 @@ class ProgressManager:
         bar = '█' * filled + '░' * (bar_length - filled)
         
         # [filename] ████████░░ 65% | 7.8 GB / 12 GB | 245 MB/s | ETA: 00:17
-        return f"\r[{self.file_name[:20]:<20}] {bar} {percent:5.1f}% | {format_size(self.copied_size):>8} / {format_size(self.total_size):<8} | {format_speed(self.copied_size, elapsed):>8} | ETA: {format_time(eta_seconds):>6}"
+        return f"\r[{self.file_name[:30]:<30}] {bar} {percent:5.1f}% | {format_size(self.copied_size):>8} / {format_size(self.total_size):<8} | {format_speed(self.copied_size, elapsed):>8} | ETA: {format_time(eta_seconds):>6}"
 
 
 class CheckpointManager:
@@ -958,7 +979,8 @@ def sync_single_pair(
 
         if double_verify:
             verified, verify_hash, verify_error = verify_file_hash(
-                target_path, algorithm, source_hash, retries=retries
+                target_path, algorithm, source_hash, retries=retries,
+                file_name=rel_path, total_size=source_size
             )
             file_result.verify_hash = verify_hash
             if not verified:
