@@ -79,99 +79,6 @@ class TestHashComputation:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-class TestStreamingCopy:
-    """Test streaming copy function"""
-
-    @pytest.fixture
-    def temp_dirs(self):
-        """Create temporary source and target directories"""
-        source = Path(tempfile.mkdtemp())
-        target = Path(tempfile.mkdtemp())
-        yield source, target
-        shutil.rmtree(source, ignore_errors=True)
-        shutil.rmtree(target, ignore_errors=True)
-
-    def test_copy_small_file(self, temp_dirs):
-        """Test copying a small file"""
-        source, target = temp_dirs
-        test_file = source / "test.txt"
-        test_file.write_bytes(b"Hello, World!")
-
-        src_hash, copy_time, bytes_copied, error = sync_pro.copy_with_streaming_hash(
-            test_file, target / "test.txt", "md5"
-        )
-
-        assert error == ""
-        assert bytes_copied == 13
-        assert (target / "test.txt").exists()
-        assert (target / "test.txt").read_bytes() == b"Hello, World!"
-
-    def test_copy_large_file(self, temp_dirs):
-        """Test copying a larger file"""
-        source, target = temp_dirs
-        test_file = source / "large.bin"
-        test_data = os.urandom(1024 * 100)  # 100KB
-        test_file.write_bytes(test_data)
-
-        src_hash, copy_time, bytes_copied, error = sync_pro.copy_with_streaming_hash(
-            test_file, target / "large.bin", "md5"
-        )
-
-        assert error == ""
-        assert bytes_copied == len(test_data)
-        assert (target / "large.bin").exists()
-
-        # Verify content matches
-        expected_hash = hashlib.md5(test_data).hexdigest()
-        assert src_hash == expected_hash
-
-    def test_copy_preserves_hash(self, temp_dirs):
-        """Test that streaming copy produces correct hash"""
-        source, target = temp_dirs
-        test_file = source / "test.txt"
-        test_data = b"Testing hash computation during copy"
-        test_file.write_bytes(test_data)
-
-        expected_hash = hashlib.md5(test_data).hexdigest()
-        src_hash, _, _, error = sync_pro.copy_with_streaming_hash(
-            test_file, target / "test.txt", "md5"
-        )
-
-        assert error == ""
-        assert src_hash == expected_hash
-
-        # Verify target file hash
-        target_hash, _, _, _ = sync_pro.compute_file_hash(target / "test.txt", "md5")
-        assert target_hash == expected_hash
-
-
-class TestFileSizeMismatch:
-    """Test file size mismatch detection"""
-
-    @pytest.fixture
-    def temp_dirs(self):
-        """Create temporary source and target directories"""
-        source = Path(tempfile.mkdtemp())
-        target = Path(tempfile.mkdtemp())
-        yield source, target
-        shutil.rmtree(source, ignore_errors=True)
-        shutil.rmtree(target, ignore_errors=True)
-
-    def test_size_mismatch_detected(self, temp_dirs):
-        """Test that size mismatch is detected"""
-        source, target = temp_dirs
-        src_file = source / "test.txt"
-        tgt_file = target / "test.txt"
-
-        src_file.write_bytes(b"Content 1 - longer")
-        tgt_file.write_bytes(b"Content 2")
-
-        src_size = src_file.stat().st_size
-        tgt_size = tgt_file.stat().st_size
-
-        assert src_size != tgt_size
-
-
 class TestHashMismatch:
     """Test hash mismatch detection"""
 
@@ -346,7 +253,7 @@ class TestMHLSidecarGeneration:
         test_file.write_bytes(b"Test content for sidecar")
 
         # Copy file first and get hash
-        src_hash, _, _, _ = sync_pro.copy_with_streaming_hash(test_file, target / "test.txt", "xxhash")
+        src_hash, _, _, _ = sync_pro._copy_and_hash_file(test_file, target / "test.txt", "xxhash")
 
         # Generate sidecar
         sync_pro.generate_sidecar_hash_file(target / "test.txt", src_hash, "xxhash")
@@ -360,7 +267,7 @@ class TestMHLSidecarGeneration:
         test_file = source / "test.txt"
         test_file.write_bytes(b"Test content")
 
-        src_hash, _, _, _ = sync_pro.copy_with_streaming_hash(test_file, target / "test.txt", "md5")
+        src_hash, _, _, _ = sync_pro._copy_and_hash_file(test_file, target / "test.txt", "md5")
         sync_pro.generate_sidecar_hash_file(target / "test.txt", src_hash, "md5")
 
         sidecar = target / "test.txt.md5"
@@ -457,7 +364,7 @@ class TestMetadataPreservation:
         os.utime(test_file, (mtime, mtime))
 
         # Copy with metadata
-        sync_pro.copy_with_streaming_hash(test_file, target / "test.txt", "md5")
+        sync_pro._copy_and_hash_file(test_file, target / "test.txt", "md5")
 
         # Check timestamps are preserved
         src_stat = test_file.stat()
@@ -473,7 +380,7 @@ class TestMetadataPreservation:
         test_file.write_bytes(b"Test content")
 
         # Just copy, no special metadata handling
-        sync_pro.copy_with_streaming_hash(test_file, target / "test.txt", "md5")
+        sync_pro._copy_and_hash_file(test_file, target / "test.txt", "md5")
 
         # File should exist and have correct content
         assert (target / "test.txt").exists()
@@ -543,11 +450,53 @@ class TestMultiSourceCopy:
         test_file.write_bytes(b"Test content")
 
         # Copy and generate sidecar
-        src_hash, _, _, _ = sync_pro.copy_with_streaming_hash(test_file, target / "test.txt", "md5")
+        src_hash, _, _, _ = sync_pro._copy_and_hash_file(test_file, target / "test.txt", "md5")
         sync_pro.generate_sidecar_hash_file(target / "test.txt", src_hash, "md5")
 
         assert (target / "test.txt").exists()
         assert (target / "test.txt.md5").exists()
+
+    def test_multi_source_with_unexpected_error_exits_non_zero(self, temp_multi_dirs, monkeypatch, capsys):
+        """Test that run_multi_source exits non-zero if a task raises an unexpected exception"""
+        sources, targets = temp_multi_dirs
+        
+        # Mock sync_single_pair to raise an error on the second call
+        call_count = 0
+        original_sync = sync_pro.sync_single_pair
+        def mock_sync_single_pair(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise ValueError("Simulated unexpected error")
+            return original_sync(*args, **kwargs)
+
+        monkeypatch.setattr(sync_pro, "sync_single_pair", mock_sync_single_pair)
+
+        # Mock argparse Namespace
+        class MockArgs:
+            parallel = 2
+            verbose = True
+            double_verify = False
+            skip_existing = False
+            preserve_metadata = True
+            preserve_xattr = False
+            sidecar = False
+            retries = 1
+            mhl = False
+            report = None
+            project_name = "TestProject"
+        
+        args = MockArgs()
+        args.sources = [str(s) for s in sources]
+        args.targets = [str(t) for t in targets]
+        
+        exit_code = sync_pro.run_multi_source(args, "md5")
+        
+        assert exit_code != 0
+        
+        captured = capsys.readouterr()
+        assert "Simulated unexpected error" in captured.err
+
 
 
 class TestScanFolderSkipsSidecar:
@@ -727,98 +676,23 @@ class TestCheckpointManager:
         # Note: cleanup only removes file when sync completes successfully
         # For now just verify method runs without error
 
+    def test_corrupt_checkpoint_loads_new_state(self, temp_dirs, capsys):
+        """Test that a corrupt checkpoint file results in a new state and a warning"""
+        source, target, checkpoint = temp_dirs
+        
+        # Create a corrupt checkpoint file
+        checkpoint.write_text("this is not valid json")
+        
+        cm = sync_pro.CheckpointManager(source, target, checkpoint)
+        
+        # Check for warning in stderr
+        captured = capsys.readouterr()
+        assert "无法加载进度文件" in captured.err
+        
+        # Check that the state is a new, fresh one
+        assert "file1.txt" not in cm.state["files"]
+        assert cm.state["current_file"] == ""
 
-class TestCopyWithResume:
-    """Test copy_with_resume function"""
-
-    @pytest.fixture
-    def temp_dirs(self):
-        """Create temporary source and target directories"""
-        source = Path(tempfile.mkdtemp())
-        target = Path(tempfile.mkdtemp())
-        yield source, target
-        shutil.rmtree(source, ignore_errors=True)
-        shutil.rmtree(target, ignore_errors=True)
-
-    def test_copy_resume_new_file(self, temp_dirs):
-        """Test copying a new file with resume function"""
-        source, target = temp_dirs
-        
-        # Create source file
-        test_data = b"Hello, World!" * 1000
-        source_file = source / "test.txt"
-        source_file.write_bytes(test_data)
-        
-        # Copy with resume
-        target_file = target / "test.txt"
-        hash_val, duration, bytes_copied, error = sync_pro.copy_with_resume(
-            source_file, target_file, "md5"
-        )
-        
-        assert error == ""
-        assert bytes_copied == len(test_data)
-        assert target_file.exists()
-        assert target_file.read_bytes() == test_data
-
-    def test_copy_resume_existing_partial_file(self, temp_dirs):
-        """Test resuming a partially copied file"""
-        source, target = temp_dirs
-        
-        # Create source file
-        test_data = b"X" * 10000
-        source_file = source / "test.txt"
-        source_file.write_bytes(test_data)
-        
-        # Create partial target file
-        target_file = target / "test.txt"
-        target_file.write_bytes(b"X" * 5000)
-        
-        # Copy with resume
-        hash_val, duration, bytes_copied, error = sync_pro.copy_with_resume(
-            source_file, target_file, "md5", resume=True
-        )
-        
-        assert error == ""
-        assert bytes_copied == 10000
-        assert target_file.read_bytes() == test_data
-
-    def test_copy_resume_complete_file_returns_match(self, temp_dirs):
-        """Test that complete file returns MATCH status"""
-        source, target = temp_dirs
-        
-        # Create identical source and target
-        test_data = b"Complete file content"
-        source_file = source / "test.txt"
-        source_file.write_bytes(test_data)
-        target_file = target / "test.txt"
-        target_file.write_bytes(test_data)
-        
-        hash_val, duration, bytes_copied, error = sync_pro.copy_with_resume(
-            source_file, target_file, "md5", resume=True
-        )
-        
-        import hashlib; expected_hash = hashlib.md5(test_data).hexdigest(); assert hash_val == expected_hash
-
-    def test_copy_resume_with_progress(self, temp_dirs):
-        """Test copy_with_resume with progress manager"""
-        source, target = temp_dirs
-        
-        # Create source file
-        test_data = b"X" * 100000
-        source_file = source / "test.txt"
-        source_file.write_bytes(test_data)
-        
-        # Create progress manager
-        progress_mgr = sync_pro.ProgressManager(len(test_data), "test.txt", enabled=True)
-        
-        # Copy with progress
-        target_file = target / "test.txt"
-        hash_val, duration, bytes_copied, error = sync_pro.copy_with_resume(
-            source_file, target_file, "md5", progress_manager=progress_mgr
-        )
-        
-        assert error == ""
-        assert bytes_copied == len(test_data)
 
 
 class TestSleepDetector:
@@ -856,3 +730,229 @@ class TestSignalHandling:
         import signal as sig
         assert hasattr(sig, 'SIGINT')
         assert hasattr(sig, 'signal')
+
+
+class TestCopyAndHashFile:
+    """Test _copy_and_hash_file function"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        """Create temporary source and target directories"""
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_copy_small_file(self, temp_dirs):
+        """Test copying a small file"""
+        source, target = temp_dirs
+        test_data = b"Hello, World!"
+        source_file = source / "test.txt"
+        source_file.write_bytes(test_data)
+        
+        hash_val, _, bytes_copied, error = sync_pro._copy_and_hash_file(
+            source_file, target / "test.txt", "md5"
+        )
+        
+        assert error == ""
+        assert bytes_copied == len(test_data)
+        assert (target / "test.txt").exists()
+        assert (target / "test.txt").read_bytes() == test_data
+        assert hash_val == hashlib.md5(test_data).hexdigest()
+
+    def test_copy_large_file(self, temp_dirs):
+        """Test copying a larger file with xxhash"""
+        source, target = temp_dirs
+        test_data = os.urandom(1024 * 100)  # 100KB
+        source_file = source / "large.bin"
+        source_file.write_bytes(test_data)
+        
+        hash_val, _, bytes_copied, error = sync_pro._copy_and_hash_file(
+            source_file, target / "large.bin", "xxhash"
+        )
+        
+        assert error == ""
+        assert bytes_copied == len(test_data)
+        assert (target / "large.bin").exists()
+        
+        if sync_pro.HAS_XXHASH:
+            assert hash_val == sync_pro.xxhash.xxh64(test_data).hexdigest()
+        else:
+            assert hash_val == hashlib.md5(test_data).hexdigest() # Fallback
+
+    def test_resume_partial_file(self, temp_dirs):
+        """Test resuming a partially copied file"""
+        source, target = temp_dirs
+        
+        full_data = b"X" * 10000
+        source_file = source / "test.txt"
+        source_file.write_bytes(full_data)
+        
+        partial_data = b"X" * 5000
+        target_file = target / "test.txt"
+        target_file.write_bytes(partial_data)
+        
+        hash_val, _, bytes_copied, error = sync_pro._copy_and_hash_file(
+            source_file, target_file, "md5", resume=True
+        )
+        
+        assert error == ""
+        assert bytes_copied == len(full_data)
+        assert target_file.read_bytes() == full_data
+        assert hash_val == hashlib.md5(full_data).hexdigest()
+
+    def test_existing_complete_file_skip(self, temp_dirs):
+        """Test that existing complete file is skipped and hash is returned"""
+        source, target = temp_dirs
+        
+        test_data = b"Complete file content"
+        source_file = source / "test.txt"
+        source_file.write_bytes(test_data)
+        target_file = target / "test.txt"
+        target_file.write_bytes(test_data)
+        
+        expected_hash = hashlib.md5(test_data).hexdigest()
+        
+        # Simulate time passing to check if file modification time changes (it shouldn't if skipped)
+        initial_mtime = target_file.stat().st_mtime
+        import time; time.sleep(0.1) # Ensure some time passes
+        
+        hash_val, duration, bytes_copied, error = sync_pro._copy_and_hash_file(
+            source_file, target_file, "md5", resume=True
+        )
+        
+        assert error == ""
+        assert hash_val == expected_hash
+        assert bytes_copied == len(test_data)
+        assert duration < 0.1 # Should be very fast as it's skipped
+        assert target_file.stat().st_mtime == initial_mtime # mtime should be preserved
+
+    def test_resume_corrupt_partial_file_restarts(self, temp_dirs):
+        """Test that a corrupt partial file is detected and the copy restarts"""
+        source, target = temp_dirs
+        
+        source_data = b"A" * 10000
+        source_file = source / "test.txt"
+        source_file.write_bytes(source_data)
+        
+        # Create a partial file with different content
+        corrupt_partial_data = b"B" * 5000
+        target_file = target / "test.txt"
+        target_file.write_bytes(corrupt_partial_data)
+        
+        hash_val, _, bytes_copied, error = sync_pro._copy_and_hash_file(
+            source_file, target_file, "md5", resume=True
+        )
+        
+        assert error == ""
+        assert bytes_copied == len(source_data)
+        assert target_file.read_bytes() == source_data
+        assert hash_val == hashlib.md5(source_data).hexdigest()
+
+    def test_corrupted_target_file_restarts(self, temp_dirs):
+        """Test that corrupted target file (larger than source) restarts copy"""
+        source, target = temp_dirs
+        
+        source_data = b"short"
+        source_file = source / "test.txt"
+        source_file.write_bytes(source_data)
+        
+        corrupted_data = b"this is longer than source"
+        target_file = target / "test.txt"
+        target_file.write_bytes(corrupted_data)
+        
+        hash_val, _, bytes_copied, error = sync_pro._copy_and_hash_file(
+            source_file, target_file, "md5", resume=True
+        )
+        
+        assert error == ""
+        assert bytes_copied == len(source_data)
+        assert target_file.read_bytes() == source_data
+        assert hash_val == hashlib.md5(source_data).hexdigest()
+
+    def test_copy_with_progress_manager(self, temp_dirs, capsys):
+        """Test copy with an enabled ProgressManager"""
+        source, target = temp_dirs
+        test_data = b"X" * (1024 * 10) # 10KB
+        source_file = source / "test.txt"
+        source_file.write_bytes(test_data)
+        
+        # Create a mock ProgressManager
+        class MockProgressManager:
+            def __init__(self, total_size, file_name, enabled=True):
+                self.total_size = total_size
+                self.file_name = file_name
+                self.enabled = enabled
+                self.updates = []
+            def update(self, bytes_copied, current_pos=None):
+                self.updates.append(bytes_copied)
+                return f"progress update for {self.file_name}"
+        
+        mock_pm = MockProgressManager(len(test_data), "test.txt")
+        
+        sync_pro._copy_and_hash_file(
+            source_file, target / "test.txt", "md5", progress_manager=mock_pm
+        )
+        
+        assert len(mock_pm.updates) > 0 # Should have received updates
+        # Check stdout for progress output (captured by capsys)
+        captured = capsys.readouterr()
+        assert "progress update for test.txt" in captured.out
+
+    def test_copy_with_checkpoint_manager(self, temp_dirs):
+        """Test copy with CheckpointManager for saving progress"""
+        source, target = temp_dirs
+        checkpoint_file = target / ".sync-progress.json"
+        
+        test_data = b"Y" * (1024 * 100) # 100KB
+        source_file = source / "long_file.bin"
+        source_file.write_bytes(test_data)
+        
+        cm = sync_pro.CheckpointManager(source, target, checkpoint_file)
+        
+        # Temporarily make the checkpoint interval very small for testing
+        original_interval = cm.interval
+        cm.interval = 0.01 
+        
+        hash_val, _, bytes_copied, error = sync_pro._copy_and_hash_file(
+            source_file, target / "long_file.bin", "md5", checkpoint_manager=cm
+        )
+        # Manually mark as complete to ensure final state is written, mirroring run_copy logic
+        cm.mark_complete("long_file.bin", bytes_copied, hash_val)
+
+        cm.interval = original_interval # Restore original
+
+        assert error == ""
+        assert bytes_copied == len(test_data)
+        assert checkpoint_file.exists()        
+        # Check checkpoint state
+        cm_reloaded = sync_pro.CheckpointManager(source, target, checkpoint_file)
+        assert cm_reloaded.state["files"]["long_file.bin"]["size"] == len(test_data)
+        assert cm_reloaded.state["files"]["long_file.bin"]["hash"] == hash_val
+
+
+class TestPathValidation:
+    """Test path validation logic"""
+
+    def test_source_target_same_path_fails(self, monkeypatch, capsys):
+        """Test that the script exits if source and target are the same"""
+        temp_dir = tempfile.mkdtemp()
+        
+        # Mock sys.argv
+        monkeypatch.setattr(sys, 'argv', ['check_sync_pro.py', temp_dir, temp_dir])
+        
+        # Mock sys.exit
+        with pytest.raises(SystemExit) as e:
+            sync_pro.main()
+        
+        # Check that sys.exit was called with a non-zero exit code
+        assert e.type == SystemExit
+        assert e.value.code != 0
+        
+        # Check for error message in stderr
+        captured = capsys.readouterr()
+        assert "源路径和目标路径不能相同" in captured.err
+        
+        shutil.rmtree(temp_dir)
+

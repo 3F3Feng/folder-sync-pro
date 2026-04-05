@@ -17,7 +17,7 @@ Folder Sync Pro is a professional media offload verification tool designed for p
 - 🔄 **错误重试** - IO 错误自动重试（指数退避）
 - 📊 **详细报告** - JSON 格式完整校验报告
 - ⚡ **xxHash 支持** - 比 MD5 快 10 倍
-- 🧵 **多线程** - 可配置并发线程数
+- 🔄 **断点续传** - 支持大文件中断后恢复拷贝
 
 ### 专业 DIT 功能
 
@@ -53,6 +53,22 @@ pip install xattr
 # 从存储卡拷贝到目标文件夹
 python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01
 ```
+
+### 断点续传 / Resuming Copies
+对于大文件拷贝，中断后恢复的功能至关重要。
+
+```bash
+# 启用实时进度条，并每 10 秒保存一次进度
+# 如果中断，会自动在目标文件夹下生成 .sync-progress.json 文件
+python3 check_sync_pro.py /path/to/source /path/to/target --progress
+
+# 自定义进度保存间隔（例如每 5 秒）
+python3 check_sync_pro.py /path/to/source /path/to/target --progress --checkpoint 5
+
+# 从指定的进度文件恢复拷贝
+python3 check_sync_pro.py --resume /path/to/target/.sync-progress.json
+```
+**注意:** 当使用 `--progress` 时，如果脚本被中断 (Ctrl+C)，它会尝试保存最后的进度，并提示如何恢复。
 
 ### 启用双重校验
 ```bash
@@ -135,7 +151,6 @@ python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 \
   --double-verify \
   --retries 5 \
   --hash xxhash \
-  --threads 4 \
   --report report.json \
   --mhl \
   --sidecar \
@@ -188,7 +203,6 @@ python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 \
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--threads N` | 并发线程数 | 4 |
 | `--skip-existing` | 跳过已存在的文件 | 否 |
 
 ### 元数据参数
@@ -204,6 +218,14 @@ python3 check_sync_pro.py /Volumes/SD_CARD/DCIM ~/Photos/2024-01-01 \
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--verbose` `-v` | 显示详细进度 | 否 |
+
+### 断点续传参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--progress` | 显示实时进度条并启用进度保存 | 否 |
+| `--resume FILE` | 从指定的进度文件恢复拷贝 | 无 |
+| `--checkpoint N`| 每 N 秒保存一次进度 | 10 |
 
 ## MHL 报告格式 / MHL Report Format
 
@@ -275,6 +297,18 @@ a1b2c3d4e5f67890
 2. **二次校验**：拷贝完成后，重新读取目标文件计算哈希并比对
 
 这提供了最高级别的数据安全保障，确保目标文件写入正确无误。
+
+### 断点续传与恢复 (Resuming Copies)
+启用 `--progress` 后，脚本会周期性地（通过 `--checkpoint` 控制）将当前拷贝进度保存到目标文件夹下的 `.sync-progress.json` 文件中。如果拷贝过程被中断（如 `Ctrl+C`、系统休眠或奔溃），可以从这个文件恢复。
+
+**恢复时的安全校验**:
+为了防止从已损坏的局部文件继续拷贝，恢复流程包含一个关键的校验步骤：
+1.  计算已存在局部文件的哈希值。
+2.  计算源文件对应部分的哈希值。
+3.  **只有当两个哈希值完全一致时**，才会从断点继续拷贝。
+4.  如果哈希值不匹配，说明局部文件已损坏，脚本会自动删除损坏文件，从头开始拷贝。
+
+这个机制确保了即使在恢复拷贝时，数据的完整性也得到最高保障。
 
 ### 错误重试机制
 采用指数退避策略：
