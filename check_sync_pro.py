@@ -972,7 +972,7 @@ def sync_single_pair(
             preserve_metadata=preserve_metadata,
             preserve_xattr=preserve_xattr,
             checkpoint_manager=checkpoint_manager,
-            progress_manager=progress_mgr,
+            progress_callback=progress_mgr.update_file_progress if progress_mgr else None,
             resume=resume or bool(checkpoint_manager) # Enable resume if checkpointing is on
         )
 

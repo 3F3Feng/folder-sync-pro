@@ -565,32 +565,32 @@ class TestProjectNameInMHL:
 
 
 class TestProgressManager:
-    """Test ProgressManager for real-time progress display"""
+    """Test ProgressManager for dual-line progress display"""
 
     def test_progress_manager_initialization(self):
-        """Test ProgressManager initialization"""
-        pm = sync_pro.ProgressManager(1000, "test.txt", enabled=False)
-        assert pm.total_size == 1000
-        assert pm.file_name == "test.txt"
+        """Test ProgressManager initialization with new API"""
+        pm = sync_pro.ProgressManager(total_files=10, total_bytes=1000, enabled=False)
+        assert pm.total_files == 10
+        assert pm.total_bytes == 1000
         assert pm.enabled is False
-        assert pm.copied_size == 0
+        assert pm.completed_files == 0
+        assert pm.completed_bytes == 0
 
-    def test_progress_manager_disabled_returns_none(self):
-        """Test that disabled ProgressManager returns None on update"""
-        pm = sync_pro.ProgressManager(1000, "test.txt", enabled=False)
-        result = pm.update(100)
-        assert result is None
+    def test_progress_manager_start_file(self):
+        """Test starting a new file"""
+        pm = sync_pro.ProgressManager(total_files=10, total_bytes=1000, enabled=False)
+        pm.start_file("test.txt", 100)
+        assert pm.current_file == "test.txt"
+        assert pm.current_file_size == 100
+        assert pm.current_file_copied == 0
 
-    def test_progress_manager_enabled_returns_bar(self):
-        """Test that enabled ProgressManager returns progress bar"""
-        pm = sync_pro.ProgressManager(1000, "test.txt", enabled=True)
-        import time
-        time.sleep(1.1)  # Wait to ensure update interval passed
-        result = pm.update(100)
-        assert result is not None
-        assert "test.txt" in result
-        assert "%" in result
-        assert "ETA:" in result
+    def test_progress_manager_complete_file(self):
+        """Test completing a file"""
+        pm = sync_pro.ProgressManager(total_files=10, total_bytes=1000, enabled=False)
+        pm.start_file("test.txt", 100)
+        pm.complete_file(100)
+        assert pm.completed_files == 1
+        assert pm.completed_bytes == 100
 
     def test_progress_manager_format_time(self):
         """Test time formatting helper"""
@@ -871,34 +871,27 @@ class TestCopyAndHashFile:
         assert target_file.read_bytes() == source_data
         assert hash_val == hashlib.md5(source_data).hexdigest()
 
-    def test_copy_with_progress_manager(self, temp_dirs, capsys):
-        """Test copy with an enabled ProgressManager"""
+    def test_copy_with_progress_callback(self, temp_dirs, capsys):
+        """Test copy with a progress callback"""
         source, target = temp_dirs
-        test_data = b"X" * (1024 * 10) # 10KB
+        test_data = b"X" * (1024 * 10)  # 10KB
         source_file = source / "test.txt"
         source_file.write_bytes(test_data)
-        
-        # Create a mock ProgressManager
-        class MockProgressManager:
-            def __init__(self, total_size, file_name, enabled=True):
-                self.total_size = total_size
-                self.file_name = file_name
-                self.enabled = enabled
-                self.updates = []
-            def update(self, bytes_copied, current_pos=None):
-                self.updates.append(bytes_copied)
-                return f"progress update for {self.file_name}"
-        
-        mock_pm = MockProgressManager(len(test_data), "test.txt")
-        
+
+        # Track progress updates
+        updates = []
+        def progress_callback(bytes_copied):
+            updates.append(bytes_copied)
+
         sync_pro._copy_and_hash_file(
-            source_file, target / "test.txt", "md5", progress_manager=mock_pm
+            source_file,
+            target / "test.txt",
+            "md5",
+            progress_callback=progress_callback
         )
-        
-        assert len(mock_pm.updates) > 0 # Should have received updates
-        # Check stdout for progress output (captured by capsys)
-        captured = capsys.readouterr()
-        assert "progress update for test.txt" in captured.out
+
+        assert len(updates) > 0  # Should have received updates
+        assert updates[-1] == len(test_data)  # Final update should be full size
 
     def test_copy_with_checkpoint_manager(self, temp_dirs):
         """Test copy with CheckpointManager for saving progress"""
