@@ -181,192 +181,128 @@ def compute_file_hash(
 # See below for copy_with_resume and copy_with_streaming_hash
 
 
-def copy_with_resume(
+def _copy_and_hash_file(
     source_path: Path,
     target_path: Path,
     algorithm: str,
-    checkpoint_manager: Optional[CheckpointManager] = None,
-    progress_manager: Optional[ProgressManager] = None,
     chunk_size: int = 1024 * 1024,
     retries: int = 3,
     preserve_metadata: bool = True,
     preserve_xattr: bool = False,
-    checkpoint_interval: int = 10,
-    resume: bool = False
+    checkpoint_manager: Optional[CheckpointManager] = None,
+    progress_manager: Optional[ProgressManager] = None,
+    resume: bool = False,
 ) -> Tuple[str, float, int, str]:
     """
-    支持断点续传的流式拷贝
+    Copies a file with streaming hash calculation, retries, and resume support.
     
-    返回: (哈希值, 耗时, 拷贝字节数, 错误信息)
+    Returns: (hash_value, time_taken, bytes_copied, error_message)
     """
     source_size = source_path.stat().st_size
-    rel_path = str(source_path.relative_to(checkpoint_manager.source)) if checkpoint_manager else str(source_path)
-    
-    target_size = 0
-    if resume and target_path.exists():
-        target_size = target_path.stat().st_size
-        
-    # 如果目标文件已存在且大小等于源文件，计算哈希值
-    if target_size == source_size:
-        # 文件已完整存在，计算哈希值
-        print(f"✅ 文件已完整存在，计算哈希值...")
-        hash_func = get_hash_func(algorithm)
-        verified = 0
-        with open(target_path, 'rb') as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                hash_func.update(chunk)
-                verified += len(chunk)
-                # 显示进度
-                if verified % (1024 * 1024 * 1024) < chunk_size:
-                    pct = verified * 100 // source_size
-                    print(f"\r   哈希进度: {pct}%", end='', flush=True)
-        print()
-        return hash_func.hexdigest(), 0.0, target_size, ""
-
-    # 如果目标文件大于源文件，可能已经损坏，重头开始
-    if target_size > source_size:
-        target_size = 0
-
     hash_func = get_hash_func(algorithm)
-    bytes_copied = target_size
+    bytes_copied = 0
     start_time = time.time()
-    last_error = ""
     last_checkpoint_time = start_time
+    last_error = ""
 
-    # 如果是续传，需要重新读一遍已存在部分计算哈希
-    if target_size > 0:
-        # 显示验证进度，避免用户以为卡住
-        print(f"🔄 验证已存在部分: {format_size(target_size)}")
-        verified = 0
-        try:
-            with open(target_path, 'rb') as f:
-                while True:
-                    chunk = f.read(chunk_size)
-                    if not chunk: break
-                    hash_func.update(chunk)
-                    verified += len(chunk)
-                    # 每1GB显示一次进度
-                    if verified % (1024 * 1024 * 1024) < chunk_size:
-                        pct = verified * 100 // target_size
-                        print(f"\r   验证进度: {pct}% ({format_size(verified)}/{format_size(target_size)})", end='', flush=True)
-            print()  # 换行
-            print(f"💾 从断点继续拷贝...")
-            mode = 'ab'
-        except Exception as e:
-            last_error = f"无法读取已存在的块: {e}"
-            target_size = 0
-            bytes_copied = 0
-            mode = 'wb'
-    else:
-        mode = 'wb'
+    # --- Resume Logic ---
+    if resume and target_path.exists():
+        current_target_size = target_path.stat().st_size
+        if current_target_size > source_size:
+            # Corrupted target, start from scratch
+            try:
+                target_path.unlink()
+                bytes_copied = 0
+            except OSError as e:
+                return "", time.time() - start_time, 0, f"Failed to delete corrupted target file: {e}"
+        elif current_target_size == source_size:
+            # File might be complete, verify hash
+            print(f"✅ File exists and size matches. Verifying hash...")
+            hash_val, _, _, err = compute_file_hash(target_path, algorithm)
+            if not err:
+                # If hash matches, we can skip. Here we return the hash as if we copied it.
+                return hash_val, 0.0, source_size, "" 
+            else:
+                 print(f"⚠️ Verification failed ({err}), re-copying.")
+                 bytes_copied = 0
+        else: # current_target_size < source_size
+            # Partial file exists, verify its integrity before resuming
+            print(f"🔄 Partial file found. Verifying {format_size(current_target_size)}... ")
+            
+            # Hash the initial part of the source file
+            source_partial_hash_func = get_hash_func(algorithm)
+            try:
+                with open(source_path, 'rb') as f:
+                    # Read only up to current_target_size
+                    remaining = current_target_size
+                    while remaining > 0:
+                        chunk = f.read(min(chunk_size, remaining))
+                        if not chunk: break
+                        source_partial_hash_func.update(chunk)
+                        remaining -= len(chunk)
+                
+                # Hash the existing target file
+                target_partial_hash, _, _, _ = compute_file_hash(target_path, algorithm)
 
+                if source_partial_hash_func.hexdigest() == target_partial_hash:
+                    print(f"✅ Integrity confirmed. Resuming from {format_size(current_target_size)}")
+                    # The hash_func needs to be brought to the same state
+                    hash_func = source_partial_hash_func
+                    bytes_copied = current_target_size
+                else:
+                    print(f"⚠️ Partial file is corrupt. Starting over.")
+                    bytes_copied = 0
+            except (OSError, IOError) as e:
+                print(f"⚠️ Could not verify partial file ({e}), starting over.")
+                bytes_copied = 0
+    
+    # --- Copy Logic ---
+    open_mode = 'ab' if bytes_copied > 0 else 'wb'
+    
     for attempt in range(retries):
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(source_path, 'rb') as src, open(target_path, mode) as tgt:
+            with open(source_path, 'rb') as src, open(target_path, open_mode) as tgt:
                 src.seek(bytes_copied)
-                while bytes_copied < source_size:
+                
+                while True:
                     chunk = src.read(chunk_size)
                     if not chunk:
-                        break
+                        break # End of source file
+                    
                     hash_func.update(chunk)
                     tgt.write(chunk)
                     bytes_copied += len(chunk)
                     
-                    # 更新进度
                     if progress_manager:
-                        msg = progress_manager.update(len(chunk), bytes_copied)
+                        msg = progress_manager.update(len(chunk))
                         if msg:
                             sys.stdout.write(msg)
                             sys.stdout.flush()
                     
-                    # 保存检查点
                     now = time.time()
-                    if checkpoint_manager and now - last_checkpoint_time >= checkpoint_interval:
+                    if checkpoint_manager and now - last_checkpoint_time > checkpoint_manager.interval:
+                        rel_path = str(source_path.relative_to(checkpoint_manager.source))
                         checkpoint_manager.save_checkpoint(rel_path, bytes_copied)
                         last_checkpoint_time = now
 
+            # --- Finalization ---
             if preserve_metadata:
-                try:
-                    shutil.copystat(source_path, target_path)
-                except Exception:
-                    pass
-
+                shutil.copystat(source_path, target_path)
             if preserve_xattr and HAS_XATTR:
                 try:
-                    xattr.copyxattr(source_path, target_path)
+                    xattr.copyxattr(str(source_path), str(target_path))
                 except Exception:
-                    pass
-
+                    pass # Ignore errors if xattr fails
+            
             return hash_func.hexdigest(), time.time() - start_time, bytes_copied, ""
+
         except (OSError, IOError) as e:
             last_error = str(e)
             if attempt < retries - 1:
-                wait_time = 2 ** attempt
-                time.sleep(wait_time)
-            # 在失败时不删除目标文件，以便后续续传
-
-    return "", time.time() - start_time, bytes_copied, last_error
-
-
-def copy_with_streaming_hash(
-    source_path: Path,
-    target_path: Path,
-    algorithm: str,
-    chunk_size: int = 1024 * 1024,
-    retries: int = 3,
-    preserve_metadata: bool = True,
-    preserve_xattr: bool = False
-) -> Tuple[str, float, int, str]:
-    """
-    流式拷贝文件,同时计算哈希值
-    
-    返回: (哈希值, 耗时, 拷贝字节数, 错误信息)
-    """
-    hash_func = get_hash_func(algorithm)
-    bytes_copied = 0
-    start_time = time.time()
-    last_error = ""
-
-    for attempt in range(retries):
-        try:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(source_path, 'rb') as src, open(target_path, 'wb') as tgt:
-                while True:
-                    chunk = src.read(chunk_size)
-                    if not chunk:
-                        break
-                    hash_func.update(chunk)
-                    tgt.write(chunk)
-                    bytes_copied += len(chunk)
-
-            if preserve_metadata:
-                try:
-                    shutil.copystat(source_path, target_path)
-                except Exception:
-                    pass
-
-            if preserve_xattr and HAS_XATTR:
-                try:
-                    xattr.copyxattr(source_path, target_path)
-                except Exception:
-                    pass
-
-            return hash_func.hexdigest(), time.time() - start_time, bytes_copied, ""
-        except (OSError, IOError) as e:
-            last_error = str(e)
-            if target_path.exists():
-                try:
-                    target_path.unlink()
-                except:
-                    pass
-            if attempt < retries - 1:
-                wait_time = 2 ** attempt
-                time.sleep(wait_time)
-
+                time.sleep(2 ** attempt)
+            # On final retry failure, break loop
+            
     return "", time.time() - start_time, bytes_copied, last_error
 
 
@@ -384,8 +320,13 @@ def verify_file_hash(
     返回: (是否匹配, 实际哈希, 错误信息)
     """
     last_error = ""
-    bytes_read = 0
+    # 获取终端宽度，预留1个字符用于清除行尾
+    terminal_width = shutil.get_terminal_size((80, 20)).columns - 1
+
     for attempt in range(retries):
+        bytes_read = 0
+        last_update_time = 0
+        last_update_bytes = 0
         try:
             hash_func = get_hash_func(algorithm)
             with open(file_path, 'rb') as f:
@@ -395,20 +336,47 @@ def verify_file_hash(
                         break
                     hash_func.update(chunk)
                     bytes_read += len(chunk)
-                    # 每1GB显示一次进度(仅在提供大小时)
-                    if total_size > 0 and bytes_read % (1024 * 1024 * 1024) < (1024 * 1024):
-                        pct = bytes_read * 100 // total_size
-                        name = file_name[:30] if file_name else file_path.name
-                        print(f"\r🔍 双重校验: {name} ({format_size(total_size)})", end='', flush=True)
-                        print(f"\n  校验进度: {pct}% ({format_size(bytes_read)} / {format_size(total_size)})", end='', flush=True)
-            print()  # 换行
+                    
+                    now = time.time()
+                    if total_size > 0 and (now - last_update_time > 0.25 or bytes_read == total_size):
+                        elapsed_since_last_update = now - last_update_time
+                        bytes_since_last_update = bytes_read - last_update_bytes
+                        realtime_speed = bytes_since_last_update / elapsed_since_last_update if elapsed_since_last_update > 0 else 0
+                        speed_str = format_speed(bytes_since_last_update, elapsed_since_last_update)
+
+                        pct = (bytes_read / total_size) * 100 if total_size > 0 else 0
+                        
+                        remaining_bytes = total_size - bytes_read
+                        eta_seconds = remaining_bytes / realtime_speed if realtime_speed > 0 and remaining_bytes > 0 else 0
+
+                        bar_length = 30
+                        filled = int(bar_length * pct / 100)
+                        bar = '█' * filled + '░' * (bar_length - filled)
+                        
+                        name_part = (file_name[:30] + "..") if len(file_name) > 30 else file_name
+                        if not name_part: name_part = file_path.name
+                        
+                        progress_msg = f"🔍 Verifying: [{name_part:<30}] {bar} {pct:5.1f}% | {speed_str:>10} | ETA: {format_time(eta_seconds):>6}"
+                        
+                        # Pad with spaces to clear the line
+                        sys.stdout.write(f"\r{progress_msg.ljust(terminal_width)}")
+                        sys.stdout.flush()
+                        last_update_time = now
+                        last_update_bytes = bytes_read
+            
+            # Clear the line on completion
+            sys.stdout.write(f"\r{' '.ljust(terminal_width)}\r")
+            sys.stdout.flush()
+
             actual_hash = hash_func.hexdigest()
             return actual_hash == expected_hash, actual_hash, ""
         except (OSError, IOError) as e:
             last_error = str(e)
+            sys.stdout.write("\n") # Move to next line after error
             if attempt < retries - 1:
                 wait_time = 2 ** attempt
                 time.sleep(wait_time)
+                
     return False, "", last_error
 
 
@@ -476,6 +444,8 @@ class ProgressManager:
         self.start_time = time.time()
         self.last_update = self.start_time
         self.enabled = enabled
+        self.terminal_width = shutil.get_terminal_size((80, 20)).columns
+        self.last_update_bytes = 0
         
     def update(self, bytes_copied: int, current_pos: int = None) -> Optional[str]:
         """更新进度并返回进度条字符串"""
@@ -489,35 +459,48 @@ class ProgressManager:
             
         now = time.time()
         
-        # 每秒最多更新一次显示
-        if now - self.last_update < 1.0 and self.copied_size < self.total_size and bytes_copied > 0:
+        # 每秒最多更新四次显示
+        if now - self.last_update < 0.25 and self.copied_size < self.total_size:
             return None
-            
+
+        elapsed_since_last_update = now - self.last_update
+        bytes_since_last_update = self.copied_size - self.last_update_bytes
+        
+        realtime_speed = bytes_since_last_update / elapsed_since_last_update if elapsed_since_last_update > 0 else 0
+
+        # Update for next iteration
         self.last_update = now
-        elapsed = now - self.start_time
-        speed = self.copied_size / elapsed if elapsed > 0 else 0
+        self.last_update_bytes = self.copied_size
         
         # 计算百分比和 ETA
         percent = (self.copied_size / self.total_size) * 100 if self.total_size > 0 else 100
         remaining_bytes = self.total_size - self.copied_size
-        eta_seconds = remaining_bytes / speed if speed > 0 else 0
+        eta_seconds = remaining_bytes / realtime_speed if realtime_speed > 0 else 0
         
         # 生成进度条
         bar_length = 30
         filled = int(bar_length * percent / 100) if percent < 100 else bar_length
         bar = '█' * filled + '░' * (bar_length - filled)
         
-        # [filename] ████████░░ 65% | 7.8 GB / 12 GB | 245 MB/s | ETA: 00:17
-        return f"\r[{self.file_name[:30]:<30}] {bar} {percent:5.1f}% | {format_size(self.copied_size):>8} / {format_size(self.total_size):<8} | {format_speed(self.copied_size, elapsed):>8} | ETA: {format_time(eta_seconds):>6}"
+        # Use realtime speed for display and ETA
+        speed_str = format_speed(bytes_since_last_update, elapsed_since_last_update)
+        
+        progress_msg = f"[{self.file_name[:30]:<30}] {bar} {percent:5.1f}% | {format_size(self.copied_size):>8} / {format_size(self.total_size):<8} | {speed_str:>10} | ETA: {format_time(eta_seconds):>6}"
+
+        if self.copied_size >= self.total_size:
+            return f"\r{''.ljust(self.terminal_width)}\r"
+
+        return f"\r{progress_msg.ljust(self.terminal_width)}"
 
 
 class CheckpointManager:
     """断点续传状态管理"""
     
-    def __init__(self, source: Path, target: Path, checkpoint_file: Optional[Path] = None):
+    def __init__(self, source: Path, target: Path, checkpoint_file: Optional[Path] = None, interval: int = 10):
         self.source = source
         self.target = target
         self.checkpoint_file = checkpoint_file or (target / ".sync-progress.json")
+        self.interval = interval # Add this line
         self.state = self._load_or_create_state()
         
     def _load_or_create_state(self) -> dict:
@@ -525,8 +508,8 @@ class CheckpointManager:
             try:
                 with open(self.checkpoint_file, 'r') as f:
                     return json.load(f)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ 无法加载进度文件 ({e}), 将从头开始.", file=sys.stderr)
         
         return {
             "session_id": f"sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
@@ -633,7 +616,17 @@ def print_progress(current: int, total: int, current_file: str, stats: dict):
     bar = "█" * filled + "░" * (bar_len - filled)
     display_name = current_file[:40] + "..." if len(current_file) > 40 else current_file
     speed = format_speed(stats.get('bytes', 0), stats.get('time', 1))
-    print(f"\r[{bar}] {pct:5.1f}% ({current}/{total}) | {speed} | {display_name}", end="", flush=True)
+
+    terminal_width = shutil.get_terminal_size((80, 20)).columns
+    progress_line = f"[{bar}] {pct:5.1f}% ({current}/{total}) | {speed} | {display_name}"
+
+    # Pad with spaces to clear the line
+    sys.stdout.write(f"\r{progress_line.ljust(terminal_width)}")
+    sys.stdout.flush()
+
+    if current >= total:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 def detect_mode(args) -> Mode:
@@ -648,14 +641,17 @@ def detect_mode(args) -> Mode:
 
 def validate_paths(args) -> Tuple[Path, Path]:
     """验证路径并返回 source, target"""
-    source = Path(args.source)
-    target = Path(args.target)
+    source = Path(args.source).resolve()
+    target = Path(args.target).resolve()
     
     if not source.exists():
         print(f"❌ 错误: 源路径不存在: {source}", file=sys.stderr)
         sys.exit(1)
     if not source.is_dir():
         print(f"❌ 错误: 源路径不是文件夹: {source}", file=sys.stderr)
+        sys.exit(1)
+    if source == target:
+        print(f"❌ 错误: 源路径和目标路径不能相同: {source}", file=sys.stderr)
         sys.exit(1)
     
     return source, target
@@ -943,7 +939,7 @@ def sync_single_pair(
                 print(f"\n❌ 无法读取文件大小: {rel_path} ({e})")
             continue
 
-        if verbose:
+        if verbose and not show_progress:
             print_progress(idx, files_to_copy_count, rel_path, stats)
 
         if target_path.exists() and skip_existing:
@@ -951,28 +947,22 @@ def sync_single_pair(
             continue
 
         # 创建进度管理器（每个文件一个）
-        if checkpoint_manager or show_progress:
-            progress_mgr = ProgressManager(source_size, rel_path, show_progress)
-
-        # 使用带进度和断点续传的拷贝函数
-        if checkpoint_manager or show_progress:
-            source_hash, copy_time, bytes_copied, error = copy_with_resume(
-                source_path, target_path, algorithm,
-                checkpoint_manager=checkpoint_manager,
-                progress_manager=progress_mgr,
-                retries=retries,
-                preserve_metadata=preserve_metadata,
-                preserve_xattr=preserve_xattr,
-                checkpoint_interval=checkpoint_interval,
-                resume=resume
-            )
+        if show_progress:
+            progress_mgr = ProgressManager(source_size, rel_path, enabled=True)
         else:
-            source_hash, copy_time, bytes_copied, error = copy_with_streaming_hash(
-                source_path, target_path, algorithm,
-                retries=retries,
-                preserve_metadata=preserve_metadata,
-                preserve_xattr=preserve_xattr
-            )
+            progress_mgr = None
+
+        source_hash, copy_time, bytes_copied, error = _copy_and_hash_file(
+            source_path,
+            target_path,
+            algorithm,
+            retries=retries,
+            preserve_metadata=preserve_metadata,
+            preserve_xattr=preserve_xattr,
+            checkpoint_manager=checkpoint_manager,
+            progress_manager=progress_mgr,
+            resume=resume or bool(checkpoint_manager) # Enable resume if checkpointing is on
+        )
 
         if error:
             result.failed.append(rel_path)
@@ -1071,7 +1061,8 @@ def process_file_verify(
         return None
 
     verified, target_hash, verify_error = verify_file_hash(
-        target_path, algorithm, source_hash, retries=args.retries
+        target_path, algorithm, source_hash, retries=args.retries,
+        file_name=rel_path, total_size=target_size
     )
     
     file_result = FileResult(
@@ -1137,9 +1128,6 @@ def run_verify(args, algorithm: str) -> int:
     target_files = comparison['target_files']
 
     for idx, rel_path in enumerate(sorted(common_files), 1):
-        if args.verbose:
-            print_progress(idx, len(common_files), rel_path, stats)
-        
         process_file_verify(
             source_files[rel_path],
             target_files[rel_path],
@@ -1201,7 +1189,7 @@ def run_copy(args, algorithm: str) -> int:
         # 从进度文件恢复
         resume_file = Path(args.resume)
         if resume_file.exists():
-            checkpoint_manager = CheckpointManager(source, target, resume_file)
+            checkpoint_manager = CheckpointManager(source, target, resume_file, interval=args.checkpoint)
             # 从状态中恢复当前文件
             state = checkpoint_manager.state
             if state.get('current_file') or state.get('files'):
@@ -1213,7 +1201,7 @@ def run_copy(args, algorithm: str) -> int:
             print(f"⚠️ 进度文件不存在: {resume_file}")
     elif args.progress:
         # 启用进度显示，创建空的检查点管理器
-        checkpoint_manager = CheckpointManager(source, target)
+        checkpoint_manager = CheckpointManager(source, target, interval=args.checkpoint)
     
     if checkpoint_manager:
         _global_checkpoint = checkpoint_manager
@@ -1296,6 +1284,7 @@ def run_multi_source(args, algorithm: str) -> int:
         targets=targets,
         start_time=time.time()
     )
+    has_unexpected_errors = False
 
     if args.parallel <= 1:
         for source, target in source_target_pairs:
@@ -1333,6 +1322,7 @@ def run_multi_source(args, algorithm: str) -> int:
                         print(f"{status} 完成: {source.name} → {target.name} ({len(result.copied)} 个文件)")
                 except Exception as e:
                     print(f"❌ 错误: {source.name} → {target.name}: {e}", file=sys.stderr)
+                    has_unexpected_errors = True
 
     multi_result.end_time = time.time()
 
@@ -1409,7 +1399,7 @@ def run_multi_source(args, algorithm: str) -> int:
         }
         save_json_report(combined_report, args.report, args.verbose)
 
-    return 1 if sum(len(r.failed) for r in multi_result.results) else 0
+    return 1 if sum(len(r.failed) for r in multi_result.results) or has_unexpected_errors else 0
 
 
 # =============================================================================
@@ -1497,8 +1487,6 @@ def parse_args() -> argparse.Namespace:
                         help=f"哈希算法 (默认: {DEFAULT_ALGORITHM})")
 
     # 拷贝参数
-    parser.add_argument("--threads", type=int, default=4,
-                        help="并发线程数 (默认: 4)")
     parser.add_argument("--skip-existing", action="store_true",
                         help="跳过已存在的文件(不做校验)")
 
