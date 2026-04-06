@@ -499,7 +499,9 @@ class ProgressManager:
         total_bar = self._make_bar(total_pct, 20)
         file_bar = self._make_bar(file_pct, 20)
         
-        name_display = self.current_file[:20].ljust(20)
+        # Show basename of file (last component of path) to avoid truncation
+        import os
+        name_display = os.path.basename(self.current_file)[:25].ljust(25)
         if self.terminal_width >= 100:
             line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files) + " | " + format_size(self.completed_bytes) + "/" + format_size(self.total_bytes) + " | ETA: " + format_time(total_eta)
             line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display + " | " + format_size(self.current_file_copied) + "/" + format_size(self.current_file_size) + " | " + format_speed(self.current_file_copied, file_elapsed) + " | ETA: " + format_time(file_eta)
@@ -973,6 +975,9 @@ def sync_single_pair(
 
         if target_path.exists() and skip_existing:
             result.skipped.append(rel_path)
+            if shared_progress:
+                shared_progress.start_file(rel_path, source_size)
+                shared_progress.complete_file(source_size)
             continue
 
         # Use shared progress manager if provided, otherwise create per-file (backward compat)
