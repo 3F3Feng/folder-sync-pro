@@ -273,7 +273,7 @@ def _copy_and_hash_file(
                 return "", time.time() - start_time, 0, f"Failed to delete corrupted target file: {e}"
         elif current_target_size == source_size:
             # File might be complete, verify hash
-            print(f"✅ File exists and size matches. Verifying hash...")
+            print(f"✅ File exists and size matches. Verifying hash...", file=sys.stderr)
             hash_val, _, _, err = compute_file_hash(target_path, algorithm)
             if not err:
                 # If hash matches, we can skip. Here we return the hash as if we copied it.
@@ -1699,7 +1699,9 @@ def run_copy(args, algorithm: str) -> int:
         checkpoint_manager = CheckpointManager(source, target, interval=args.checkpoint)
 
     # 扫描一次源文件夹,避免在 sync_single_pair 中重复扫描
-    scan_result = scan_and_compare(source, target, False)
+    scan_result = scan_and_compare(source, target, args.verbose)
+    if args.verbose:
+        print(f"🔍 扫描: {source}")
     pre_scanned_source_files = scan_result['source_files']
 
     # 创建共享进度管理器(用于总进度追踪)
