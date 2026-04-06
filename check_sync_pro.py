@@ -1080,14 +1080,11 @@ class AuditLogger:
                 f.write("=" * 80 + "\n\n")
 
     def log(self, message: str, level: str = "INFO"):
-        """记录日志"""
+        """记录日志 - 只写入文件，不打印到 stderr（避免与正常输出重复）"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_line = f"[{timestamp}] [{level}] {message}"
         
-        # 打印到 stderr
-        print(log_line, file=sys.stderr)
-        
-        # 写入文件
+        # 只写入文件，不打印到 stderr（避免重复输出）
         if self.enabled:
             with self._lock:
                 with open(self.log_path, 'a', encoding='utf-8') as f:
@@ -1288,13 +1285,14 @@ class ProgressDisplay:
             line1 = truncate_display_width(l1, safe_width)
             line2 = truncate_display_width(l2, safe_width)
 
+            esc = chr(27)  # ANSI escape character
             if self._first_render:
-                # 首次渲染也用 \033[K 清理当前行可能存在的乱码
-                output = f"\r\033[K{line1}\n\r\033[K{line2}\n"
+                # 首次渲染：清除当前行并写入
+                output = f"{esc}[K{line1}\n{esc}[K{line2}\n"
                 self._first_render = False
             else:
-                # 向上2行 -> 清除并写入 -> 换行 -> 清除并写入 -> 换行
-                output = f"\033[2A\r\033[K{line1}\n\r\033[K{line2}\n"
+                # 后续渲染：向上2行，清除并写入
+                output = f"{esc}[2A{esc}[K{line1}\n{esc}[K{line2}\n"
         else:
             # 单行模式
             display_name = name_display.strip()
