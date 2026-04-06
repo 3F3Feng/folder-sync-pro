@@ -637,6 +637,10 @@ class ProgressManager:
             line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files)
             line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display
 
+        # Ensure output fits within terminal width to avoid wrap issues
+        line1 = line1[:terminal_width].ljust(terminal_width)
+        line2 = line2[:terminal_width].ljust(terminal_width)
+        
         # Use ANSI cursor control: move up 2 lines, clear lines, print new content
         if self._first_render:
             # First render: just print, don't try to clear previous lines
@@ -1415,8 +1419,9 @@ def sync_single_pair(
 
         if target_path.exists() and skip_existing:
             result.skipped.append(rel_path)
-            # Skip progress tracking entirely for existing files
-            # They don't contribute meaningfully to transfer progress
+            if shared_progress:
+                shared_progress.start_file(rel_path, source_size, skipped=True)
+                shared_progress.complete_file(source_size)
             continue
 
         # Use shared progress manager if provided, otherwise create per-file (backward compat)
