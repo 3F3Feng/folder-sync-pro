@@ -581,16 +581,59 @@ def check_disk_space(source_files: Dict[str, Path], target: Path, min_free_gb: f
     return True, f"{ANSIColors.STATUS_OK} 磁盘检查通过 (需要 {required_gb:.1f} GB，可用 {free_gb:.1f} GB)"
 
 
+
+def clean_pollution_files(folder: Path, verbose: bool = False) -> int:
+    """清理 macOS 污染文件，返回清理的文件数量"""
+    POLLUTING_FILES = {
+        '.DS_Store', '._.DS_Store',
+        '.Trashes', '.Trashes.DB',
+        '.Spotlight-V100',
+        '.fseventsd',
+        '.TemporaryItems',
+        '.VolumeIcon.icns',
+        'Thumbs.db',
+    }
+    
+    cleaned = 0
+    for root, _, filenames in os.walk(folder):
+        for filename in filenames:
+            if filename in POLLUTING_FILES or filename.startswith('._'):
+                full_path = Path(root) / filename
+                try:
+                    full_path.unlink()
+                    cleaned += 1
+                    if verbose:
+                        print(f"  清理: {full_path.relative_to(folder)}", file=sys.stderr)
+                except OSError as e:
+                    print(f"{ANSIColors.STATUS_WARN} 无法删除 {full_path}: {e}", file=sys.stderr)
+    
+    return cleaned
+
 def scan_folder(folder: Path, verbose: bool = False) -> Dict[str, Path]:
-    """递归扫描文件夹,返回相对路径到完整路径的映射"""
+    """递归扫描文件夹，排除哈希文件和 macOS 污染文件"""
     files = {}
     if verbose:
         print(f"🔍 扫描: {folder}", file=sys.stderr)
+    
+    # macOS 污染文件（默认忽略，不拷贝）
+    POLLUTING_FILES = {
+        '.DS_Store', '._.DS_Store',  # 桌面服务文件
+        '.Trashes', '.Trashes.DB',    # 回收站
+        '.Spotlight-V100',            # Spotlight 索引
+        '.fseventsd',                 # 文件系统事件
+        '.TemporaryItems',            # 临时文件
+        '.VolumeIcon.icns',           # 卷图标
+        'Thumbs.db',                  # Windows 缩略图
+    }
     for root, _, filenames in os.walk(folder):
         for filename in filenames:
             # 哈希文件扩展名（大小写不敏感）
             HASH_EXTENSIONS = {'.md5', '.xxhash', '.sha1', '.sha256', '.sha512'}
             if any(filename.lower().endswith(ext) for ext in HASH_EXTENSIONS):
+                continue
+            
+            # macOS 污染文件过滤
+            if filename in POLLUTING_FILES or filename.startswith('._'):
                 continue
             full_path = Path(root) / filename
             rel_path = str(full_path.relative_to(folder))
