@@ -67,10 +67,18 @@ try:
 except ImportError:
     HAS_XATTR = False
 
+# -----------------------------------------------------------------------------
+# Output Stream Configuration
+# - INFO, SUCCESS messages → stdout (progress, summary)
+# - WARNING, ERROR messages → stderr
+# - Progress bars (ANSI-controlled) → stdout
+# -----------------------------------------------------------------------------
+TERMINAL_WIDTH = shutil.get_terminal_size((80, 20)).columns
+
 
 class Mode(Enum):
     """运行模式枚举"""
-    COPY = auto()    # 拷贝模式（默认）
+    COPY = auto()    # 拷贝模式(默认)
     VERIFY = auto()  # 校验模式
     MULTI = auto()   # 多源拷贝模式
 
@@ -122,7 +130,7 @@ class MultiSourceResult:
     end_time: float = 0.0
 
 
-# 临时前向声明，避免循环依赖
+# 临时前向声明,避免循环依赖
 ProgressManager = None
 CheckpointManager = None
 SleepDetector = None
@@ -147,7 +155,7 @@ def compute_file_hash(
 ) -> Tuple[str, float, int, str]:
     """
     计算文件的哈希值
-    
+
     返回: (哈希值, 耗时, 读取字节数, 错误信息)
     """
     hash_func = get_hash_func(algorithm)
@@ -196,7 +204,7 @@ def _copy_and_hash_file(
 ) -> Tuple[str, float, int, str]:
     """
     Copies a file with streaming hash calculation, retries, and resume support.
-    
+
     Returns: (hash_value, time_taken, bytes_copied, error_message)
     """
     source_size = source_path.stat().st_size
@@ -218,18 +226,18 @@ def _copy_and_hash_file(
                 return "", time.time() - start_time, 0, f"Failed to delete corrupted target file: {e}"
         elif current_target_size == source_size:
             # File might be complete, verify hash
-            print(f"✅ File exists and size matches. Verifying hash...", file=sys.stderr)
+            print(f"✅ File exists and size matches. Verifying hash...")
             hash_val, _, _, err = compute_file_hash(target_path, algorithm)
             if not err:
                 # If hash matches, we can skip. Here we return the hash as if we copied it.
-                return hash_val, 0.0, source_size, "" 
+                return hash_val, 0.0, source_size, ""
             else:
                  print(f"⚠️ Verification failed ({err}), re-copying.", file=sys.stderr)
                  bytes_copied = 0
         else: # current_target_size < source_size
             # Partial file exists, verify its integrity before resuming
-            print(f"🔄 Partial file found. Verifying {format_size(current_target_size)}... ", file=sys.stderr)
-            
+            print(f"🔄 Partial file found. Verifying {format_size(current_target_size)}... ")
+
             # Hash the initial part of the source file
             source_partial_hash_func = get_hash_func(algorithm)
             try:
@@ -241,12 +249,12 @@ def _copy_and_hash_file(
                         if not chunk: break
                         source_partial_hash_func.update(chunk)
                         remaining -= len(chunk)
-                
+
                 # Hash the existing target file
                 target_partial_hash, _, _, _ = compute_file_hash(target_path, algorithm)
 
                 if source_partial_hash_func.hexdigest() == target_partial_hash:
-                    print(f"✅ Integrity confirmed. Resuming from {format_size(current_target_size)}", file=sys.stderr)
+                    print(f"✅ Integrity confirmed. Resuming from {format_size(current_target_size)}")
                     # The hash_func needs to be brought to the same state
                     hash_func = source_partial_hash_func
                     bytes_copied = current_target_size
@@ -256,28 +264,28 @@ def _copy_and_hash_file(
             except (OSError, IOError) as e:
                 print(f"⚠️ Could not verify partial file ({e}), starting over.", file=sys.stderr)
                 bytes_copied = 0
-    
+
     # --- Copy Logic ---
     open_mode = 'ab' if bytes_copied > 0 else 'wb'
-    
+
     for attempt in range(retries):
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
             with open(source_path, 'rb') as src, open(target_path, open_mode) as tgt:
                 src.seek(bytes_copied)
-                
+
                 while True:
                     chunk = src.read(chunk_size)
                     if not chunk:
                         break # End of source file
-                    
+
                     hash_func.update(chunk)
                     tgt.write(chunk)
                     bytes_copied += len(chunk)
-                    
+
                     if progress_callback:
                         progress_callback(bytes_copied)
-                    
+
                     now = time.time()
                     if checkpoint_manager and now - last_checkpoint_time > checkpoint_manager.interval:
                         rel_path = str(source_path.relative_to(checkpoint_manager.source))
@@ -292,7 +300,7 @@ def _copy_and_hash_file(
                     xattr.copyxattr(str(source_path), str(target_path))
                 except Exception:
                     pass # Ignore errors if xattr fails
-            
+
             return hash_func.hexdigest(), time.time() - start_time, bytes_copied, ""
 
         except (OSError, IOError) as e:
@@ -300,7 +308,7 @@ def _copy_and_hash_file(
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
             # On final retry failure, break loop
-            
+
     return "", time.time() - start_time, bytes_copied, last_error
 
 
@@ -314,12 +322,12 @@ def verify_file_hash(
 ) -> Tuple[bool, str, str]:
     """
     校验文件哈希值
-    
+
     返回: (是否匹配, 实际哈希, 错误信息)
     """
     last_error = ""
-    # 获取终端宽度，预留1个字符用于清除行尾
-    terminal_width = shutil.get_terminal_size((80, 20)).columns - 1
+    # 获取终端宽度,预留1个字符用于清除行尾
+    terminal_width = TERMINAL_WIDTH - 1
 
     for attempt in range(retries):
         bytes_read = 0
@@ -334,7 +342,7 @@ def verify_file_hash(
                         break
                     hash_func.update(chunk)
                     bytes_read += len(chunk)
-                    
+
                     now = time.time()
                     if total_size > 0 and (now - last_update_time > 0.25 or bytes_read == total_size):
                         elapsed_since_last_update = now - last_update_time
@@ -343,25 +351,25 @@ def verify_file_hash(
                         speed_str = format_speed(bytes_since_last_update, elapsed_since_last_update)
 
                         pct = (bytes_read / total_size) * 100 if total_size > 0 else 0
-                        
+
                         remaining_bytes = total_size - bytes_read
                         eta_seconds = remaining_bytes / realtime_speed if realtime_speed > 0 and remaining_bytes > 0 else 0
 
                         bar_length = 30
                         filled = int(bar_length * pct / 100)
                         bar = '█' * filled + '░' * (bar_length - filled)
-                        
+
                         name_part = (file_name[:30] + "..") if len(file_name) > 30 else file_name
                         if not name_part: name_part = file_path.name
-                        
+
                         progress_msg = f"🔍 Verifying: [{name_part:<30}] {bar} {pct:5.1f}% | {speed_str:>10} | ETA: {format_time(eta_seconds):>6}"
-                        
+
                         # Pad with spaces to clear the line
                         sys.stdout.write(f"\r{progress_msg.ljust(terminal_width)}")
                         sys.stdout.flush()
                         last_update_time = now
                         last_update_bytes = bytes_read
-            
+
             # Clear the line on completion
             sys.stdout.write(f"\r{' '.ljust(terminal_width)}\r")
             sys.stdout.flush()
@@ -374,7 +382,7 @@ def verify_file_hash(
             if attempt < retries - 1:
                 wait_time = 2 ** attempt
                 time.sleep(wait_time)
-                
+
     return False, "", last_error
 
 
@@ -386,7 +394,7 @@ def scan_folder(folder: Path, verbose: bool = False) -> Dict[str, Path]:
     """递归扫描文件夹,返回相对路径到完整路径的映射"""
     files = {}
     if verbose:
-        print(f"🔍 扫描: {folder}")
+        print(f"🔍 扫描: {folder}", file=sys.stderr)
     for root, _, filenames in os.walk(folder):
         for filename in filenames:
             if filename.endswith('.xxhash') or filename.endswith('.md5'):
@@ -400,7 +408,7 @@ def scan_folder(folder: Path, verbose: bool = False) -> Dict[str, Path]:
 def scan_and_compare(source: Path, target: Path, verbose: bool = False) -> dict:
     """
     扫描并对比两个文件夹
-    
+
     返回: {
         'common': set,       # 共同文件
         'only_source': set,  # 仅源存在
@@ -411,10 +419,10 @@ def scan_and_compare(source: Path, target: Path, verbose: bool = False) -> dict:
     """
     source_files = scan_folder(source, verbose)
     target_files = scan_folder(target, verbose)
-    
+
     source_set = set(source_files.keys())
     target_set = set(target_files.keys())
-    
+
     return {
         'common': source_set & target_set,
         'only_source': source_set - target_set,
@@ -433,8 +441,8 @@ def format_time(seconds: float) -> str:
 
 
 class ProgressManager:
-    """双行进度显示管理器（总进度 + 当前文件进度）"""
-    
+    """双行进度显示管理器(总进度 + 当前文件进度)"""
+
     def __init__(self, total_files: int, total_bytes: int, enabled: bool = True):
         self.total_files = total_files
         self.total_bytes = total_bytes
@@ -447,59 +455,128 @@ class ProgressManager:
         self.file_start_time = self.start_time
         self.last_update = self.start_time
         self.enabled = enabled
-        self.terminal_width = shutil.get_terminal_size((80, 20)).columns
+        self.terminal_width = TERMINAL_WIDTH
         self._lock = threading.Lock()
         self._first_render = True  # Track if this is the first render
+        self._pending_file = False  # Track if we have a file waiting to be rendered
+        self._skip_current_file = False  # Track if current file should be skipped (for flicker prevention)
+        self._pending_skip_current_file = False  # Track if pending file was skipped
+        self._pending_completed_files = 0  # Track files to be marked complete when next file starts
+        self._pending_completed_bytes = 0
         
-    def start_file(self, filename: str, file_size: int):
+    def start_file(self, filename: str, file_size: int, skipped: bool = False):
+        """Start tracking a new file. Use skipped=True to mark file as already complete (no render)."""
         with self._lock:
+            # If there was a previous file that just completed, apply its completion counters and render
+            if self._pending_file:
+                # Apply the pending completion counters before rendering
+                self.completed_files += self._pending_completed_files
+                self.completed_bytes += self._pending_completed_bytes
+                self._pending_completed_files = 0
+                self._pending_completed_bytes = 0
+                # Pass the pending skip flag to render
+                self._render_unlocked(final=True, skipped=self._pending_skip_current_file)
+                self._pending_file = False
+
             self.current_file = filename
             self.current_file_size = file_size
             self.current_file_copied = 0
             self.file_start_time = time.time()
+            self._skip_current_file = skipped
             
+            if skipped:
+                # For skipped files, mark as complete but DON'T render yet
+                # Defer rendering to when the next file starts to avoid flicker
+                self.current_file_copied = file_size
+                self._pending_file = True
+                self._pending_skip_current_file = True
+                self._pending_completed_files = 1
+                self._pending_completed_bytes = file_size
+            else:
+                self._pending_skip_current_file = False
+            # Don't render here - wait for update_file_progress or next file
+        
     def update_file_progress(self, bytes_copied: int):
         with self._lock:
             self.current_file_copied = bytes_copied
+            self._skip_current_file = False
             self._render_unlocked()
         
     def complete_file(self, file_size: int):
         with self._lock:
-            self.completed_files += 1
-            self.completed_bytes += file_size
+            # If file was skipped (already rendered), don't set pending flags
+            if self._skip_current_file:
+                return
+            # Mark as pending - will be applied when next file starts
+            self._pending_completed_files = 1
+            self._pending_completed_bytes = file_size
+            self._pending_file = True  # Flag that there's a pending completion
+            self._pending_skip_current_file = False  # This was a real copy, not skipped
             # Don't render here - let the next start_file or update_file_progress trigger render
             # This prevents showing progress for a file that's already complete
+    
+    def finalize(self):
+        """Finalize progress display - render any pending file."""
+        with self._lock:
+            if self._pending_file:
+                # Apply the pending completion counters before rendering
+                self.completed_files += self._pending_completed_files
+                self.completed_bytes += self._pending_completed_bytes
+                self._pending_completed_files = 0
+                self._pending_completed_bytes = 0
+                # Pass the pending skip flag to render
+                self._render_unlocked(final=True, skipped=self._pending_skip_current_file)
+                self._pending_file = False
+
+    def _render_unlocked(self, final: bool = False, skipped: bool = None):
+        """Internal render without lock - caller must hold lock. final=True forces render of completed state.
         
-    def _render_unlocked(self):
-        """Internal render without lock - caller must hold lock"""
+        Args:
+            final: If True, always render even if throttled
+            skipped: Override for skip detection. If None, uses self._skip_current_file.
+        """
         if not self.enabled:
             return
+        # Use provided skipped value or fall back to instance variable
+        effective_skipped = skipped if skipped is not None else self._skip_current_file
+        if effective_skipped and not final:
+            return  # Don't render skipped files unless forced
+
         now = time.time()
-        if now - self.last_update < 0.25 and self.current_file_copied < self.current_file_size:
+        if not final and now - self.last_update < 0.25 and self.current_file_copied < self.current_file_size:
             return
         self.last_update = now
-        
-        # For skipped files, current_file_copied equals file_size immediately, so we need to handle this
-        # Total progress includes current file bytes (estimate remaining based on actual transfer speed)
-        total_progress_bytes = self.completed_bytes + self.current_file_copied
-        remaining_bytes = self.total_bytes - total_progress_bytes
-        total_pct = (total_progress_bytes / self.total_bytes * 100) if self.total_bytes > 0 else 100
-        file_pct = (self.current_file_copied / self.current_file_size * 100) if self.current_file_size > 0 else 100
-        
+
+        # For skipped files, current_file_copied equals file_size immediately
+        # But we don't add it to total_progress_bytes since the file is already in completed_bytes
+        # Only add current_file_copied if it's less than file_size (i.e., file is actually being copied)
+        if self._skip_current_file:
+            # Skipped file: current_file_copied is just for display (file_pct), not actual progress
+            total_progress_bytes = self.completed_bytes
+            remaining_bytes = self.total_bytes - total_progress_bytes
+            total_pct = (total_progress_bytes / self.total_bytes * 100) if self.total_bytes > 0 else 100
+            file_pct = (self.current_file_copied / self.current_file_size * 100) if self.current_file_size > 0 else 100
+        else:
+            # Normal file being copied
+            total_progress_bytes = self.completed_bytes + self.current_file_copied
+            remaining_bytes = self.total_bytes - total_progress_bytes
+            total_pct = (total_progress_bytes / self.total_bytes * 100) if self.total_bytes > 0 else 100
+            file_pct = (self.current_file_copied / self.current_file_size * 100) if self.current_file_size > 0 else 100
+
         elapsed = now - self.start_time
         # Use actual transfer speed (based on total elapsed time, not just completed bytes)
         # This includes current file progress for accurate ETA
         avg_speed = total_progress_bytes / elapsed if elapsed > 0 else 0
         total_eta = remaining_bytes / avg_speed if avg_speed > 0 else 0
-        
+
         file_elapsed = now - self.file_start_time
         file_speed = self.current_file_copied / file_elapsed if file_elapsed > 0 else 0
         remaining_file_bytes = self.current_file_size - self.current_file_copied
         file_eta = remaining_file_bytes / file_speed if file_speed > 0 else 0
-        
+
         total_bar = self._make_bar(total_pct, 20)
         file_bar = self._make_bar(file_pct, 20)
-        
+
         # Show basename of file (last component of path) to avoid truncation
         import os
         name_display = os.path.basename(self.current_file)[:25].ljust(25)
@@ -509,7 +586,7 @@ class ProgressManager:
         else:
             line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files)
             line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display
-        
+
         # Use ANSI cursor control: move up 2 lines, clear lines, print new content
         if self._first_render:
             # First render: just print, don't try to clear previous lines
@@ -520,7 +597,7 @@ class ProgressManager:
             output = chr(27) + "[2A" + chr(27) + "[K" + line1 + chr(10) + chr(27) + "[K" + line2 + chr(10)
         sys.stdout.write(output)
         sys.stdout.flush()
-        
+
     def _make_bar(self, pct: float, length: int) -> str:
         filled = int(length * pct / 100)
         return chr(9608) * filled + chr(9601) * (length - filled)
@@ -528,14 +605,14 @@ class ProgressManager:
 
 class CheckpointManager:
     """断点续传状态管理"""
-    
+
     def __init__(self, source: Path, target: Path, checkpoint_file: Optional[Path] = None, interval: int = 10):
         self.source = source
         self.target = target
         self.checkpoint_file = checkpoint_file or (target / ".sync-progress.json")
         self.interval = interval # Add this line
         self.state = self._load_or_create_state()
-        
+
     def _load_or_create_state(self) -> dict:
         if self.checkpoint_file and self.checkpoint_file.exists():
             try:
@@ -543,7 +620,7 @@ class CheckpointManager:
                     return json.load(f)
             except Exception as e:
                 print(f"⚠️ 无法加载进度文件 ({e}), 将从头开始.", file=sys.stderr)
-        
+
         return {
             "session_id": f"sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             "source": str(self.source),
@@ -554,14 +631,14 @@ class CheckpointManager:
             "position": 0,
             "files": {}
         }
-    
+
     def get_resume_position(self, rel_path: str) -> int:
         """获取续传位置"""
-        # 如果文件已在 files 中标记为完成，则返回完整大小
+        # 如果文件已在 files 中标记为完成,则返回完整大小
         if rel_path in self.state.get('files', {}):
             return self.state['files'][rel_path].get('size', 0)
-        
-        # 如果是当前中断的文件，检查实际目标文件大小
+
+        # 如果是当前中断的文件,检查实际目标文件大小
         if self.state.get('current_file') == rel_path:
             target_file = self.target / rel_path
             if target_file.exists():
@@ -574,7 +651,7 @@ class CheckpointManager:
         self.state['position'] = position
         self.state['updated_at'] = datetime.now().isoformat()
         self._write_state()
-        
+
     def mark_complete(self, rel_path: str, file_size: int, hash_value: str):
         """标记文件已完成"""
         self.state['files'][rel_path] = {
@@ -586,7 +663,7 @@ class CheckpointManager:
             self.state['current_file'] = ""
             self.state['position'] = 0
         self._write_state()
-        
+
     def _write_state(self):
         try:
             self.checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
@@ -606,18 +683,18 @@ class CheckpointManager:
 
 class SleepDetector:
     """检测系统休眠并触发恢复流程"""
-    
+
     def __init__(self, on_wake_callback: Optional[Callable] = None):
         self.on_wake_callback = on_wake_callback
         self.last_timestamp = time.time()
-        
+
     def check_time_gap(self) -> bool:
-        """检测时间跳跃（可能休眠）"""
+        """检测时间跳跃(可能休眠)"""
         now = time.time()
         gap = now - self.last_timestamp
         self.last_timestamp = now
-        
-        # 如果超过 60 秒没有更新，可能休眠了
+
+        # 如果超过 60 秒没有更新,可能休眠了
         if gap > 60:
             if self.on_wake_callback:
                 self.on_wake_callback(gap)
@@ -650,11 +727,10 @@ def print_progress(current: int, total: int, current_file: str, stats: dict):
     display_name = current_file[:40] + "..." if len(current_file) > 40 else current_file
     speed = format_speed(stats.get('bytes', 0), stats.get('time', 1))
 
-    terminal_width = shutil.get_terminal_size((80, 20)).columns
     progress_line = f"[{bar}] {pct:5.1f}% ({current}/{total}) | {speed} | {display_name}"
 
     # Pad with spaces to clear the line
-    sys.stdout.write(f"\r{progress_line.ljust(terminal_width)}")
+    sys.stdout.write(f"\r{progress_line.ljust(TERMINAL_WIDTH)}")
     sys.stdout.flush()
 
     if current >= total:
@@ -676,7 +752,7 @@ def validate_paths(args) -> Tuple[Path, Path]:
     """验证路径并返回 source, target"""
     source = Path(args.source).resolve()
     target = Path(args.target).resolve()
-    
+
     if not source.exists():
         print(f"❌ 错误: 源路径不存在: {source}", file=sys.stderr)
         sys.exit(1)
@@ -686,7 +762,7 @@ def validate_paths(args) -> Tuple[Path, Path]:
     if source == target:
         print(f"❌ 错误: 源路径和目标路径不能相同: {source}", file=sys.stderr)
         sys.exit(1)
-    
+
     return source, target
 
 
@@ -694,12 +770,12 @@ def setup_algorithm(args) -> str:
     """设置哈希算法"""
     algorithm = args.hash
     if algorithm == "xxhash" and not HAS_XXHASH:
-        print("⚠️ xxhash 未安装,回退到 MD5。安装: pip install xxhash")
+        print("⚠️ xxhash 未安装,回退到 MD5。安装: pip install xxhash", file=sys.stderr)
         algorithm = "md5"
-    
+
     if args.preserve_xattr and not HAS_XATTR:
-        print("⚠️ xattr 未安装,无法保留扩展属性。安装: pip install xattr")
-    
+        print("⚠️ xattr 未安装,无法保留扩展属性。安装: pip install xattr", file=sys.stderr)
+
     return algorithm
 
 
@@ -729,7 +805,7 @@ def generate_mhl_report(
 ) -> Optional[Path]:
     """
     生成 ASC MHL v1.1 标准校验报告
-    
+
     MHL (Media Hash List) 是影视行业标准的校验报告格式
     """
     if not result.files:
@@ -748,10 +824,10 @@ def generate_mhl_report(
     ET.SubElement(creatorinfo, "version").text = "1.0.0"
     ET.SubElement(creatorinfo, "hostname").text = socket.gethostname()
     ET.SubElement(creatorinfo, "tool").text = "check_sync_pro.py"
-    
+
     start_dt = datetime.fromtimestamp(result.start_time, tz=timezone.utc)
     ET.SubElement(creatorinfo, "startdate").text = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    
+
     end_dt = datetime.fromtimestamp(result.end_time, tz=timezone.utc)
     ET.SubElement(creatorinfo, "finishdate").text = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -799,7 +875,7 @@ def generate_report(result: SyncResult) -> dict:
             "total_bytes": result.total_bytes,
             "total_size": format_size(result.total_bytes),
             "duration_seconds": round(result.end_time - result.start_time, 3),
-            "average_speed": format_speed(result.total_bytes, result.end_time - result.start_time) 
+            "average_speed": format_speed(result.total_bytes, result.end_time - result.start_time)
                 if result.end_time > result.start_time else "N/A"
         },
         "files": []
@@ -838,10 +914,10 @@ def print_result_summary(result: SyncResult, verbose: bool = True, mode: Mode = 
     """打印结果摘要"""
     if not verbose:
         return
-    
+
     mode_text = "校验完成" if mode == Mode.VERIFY else "拷贝完成"
     success_text = "校验通过" if mode == Mode.VERIFY else "成功拷贝"
-    
+
     print()
     print("\n" + "=" * 50)
     print(f"📊 {mode_text}")
@@ -900,14 +976,16 @@ def sync_single_pair(
     checkpoint_manager: Optional[CheckpointManager] = None,
     checkpoint_interval: int = 10,
     resume: bool = False,
-    progress_manager: Optional[ProgressManager] = None
+    progress_manager: Optional[ProgressManager] = None,
+    pre_scanned_source_files: Optional[Dict[str, Path]] = None
 ) -> SyncResult:
     """同步单个源-目标对"""
     target.mkdir(parents=True, exist_ok=True)
 
-    source_files = scan_folder(source, verbose)  # scan_folder prints "🔍 扫描:" internally
-    
-    # 如果是恢复模式，从检查点获取需要跳过的已完成文件
+    # Use pre-scanned files if provided, otherwise scan now
+    source_files = pre_scanned_source_files if pre_scanned_source_files is not None else scan_folder(source, verbose)
+
+    # 如果是恢复模式,从检查点获取需要跳过的已完成文件
     completed_files = set()
     if checkpoint_manager and resume:
         completed_files = set(checkpoint_manager.state.get('files', {}).keys())
@@ -924,14 +1002,14 @@ def sync_single_pair(
 
     if not source_files:
         if verbose:
-            print("⚠️ 源文件夹为空,无文件需要拷贝")
+            print("⚠️ 源文件夹为空,无文件需要拷贝", file=sys.stderr)
         result.end_time = time.time()
         return result
 
     sorted_files = sorted(source_files.items())
     total_files = len(sorted_files)
-    
-    # 计算需要拷贝的文件数（恢复模式下排除已完成的）
+
+    # 计算需要拷贝的文件数(恢复模式下排除已完成的)
     files_to_copy = [(rp, sp) for rp, sp in sorted_files if rp not in completed_files]
     files_to_copy_count = len(files_to_copy)
 
@@ -956,9 +1034,10 @@ def sync_single_pair(
         print()
 
     stats = {'bytes': 0, 'time': 0}
-    
+
     # Use shared progress_manager if provided, otherwise create per-file as fallback
     shared_progress = progress_manager
+    last_per_file_pm = None  # Track last per-file progress manager for backward compat
 
     for idx, (rel_path, source_path) in enumerate(files_to_copy, 1):
         target_path = target / rel_path
@@ -977,19 +1056,21 @@ def sync_single_pair(
         if target_path.exists() and skip_existing:
             result.skipped.append(rel_path)
             if shared_progress:
-                shared_progress.start_file(rel_path, source_size)
+                # Use skipped=True to prevent flicker (file already complete)
+                shared_progress.start_file(rel_path, source_size, skipped=True)
                 shared_progress.complete_file(source_size)
             continue
 
         # Use shared progress manager if provided, otherwise create per-file (backward compat)
         if shared_progress:
-            shared_progress.start_file(rel_path, source_size)
+            shared_progress.start_file(rel_path, source_size, skipped=False)
             progress_callback = shared_progress.update_file_progress
         elif show_progress:
             # Backward compat: per-file progress manager
             per_file_pm = ProgressManager(1, source_size, enabled=True)
-            per_file_pm.start_file(rel_path, source_size)
+            per_file_pm.start_file(rel_path, source_size, skipped=False)
             progress_callback = per_file_pm.update_file_progress
+            last_per_file_pm = per_file_pm
         else:
             progress_callback = None
 
@@ -1047,12 +1128,12 @@ def sync_single_pair(
         result.files.append(file_result)
         result.total_bytes += bytes_copied
 
-        # 更新进度管理器（标记文件完成）
+        # 更新进度管理器(标记文件完成)
         if shared_progress:
             shared_progress.complete_file(source_size)
         elif show_progress:
             per_file_pm.complete_file(source_size)
-        
+
         # 标记文件完成
         if checkpoint_manager:
             checkpoint_manager.mark_complete(rel_path, bytes_copied, source_hash)
@@ -1061,6 +1142,13 @@ def sync_single_pair(
         stats['time'] = result.end_time - result.start_time
 
     result.end_time = time.time()
+    
+    # Finalize progress display for any pending file
+    if shared_progress:
+        shared_progress.finalize()
+    elif show_progress and last_per_file_pm:
+        last_per_file_pm.finalize()
+    
     return result
 
 
@@ -1111,7 +1199,7 @@ def process_file_verify(
         target_path, algorithm, source_hash, retries=args.retries,
         file_name=rel_path, total_size=target_size
     )
-    
+
     file_result = FileResult(
         relative_path=rel_path,
         source_size=source_size,
@@ -1138,9 +1226,9 @@ def process_file_verify(
 def run_verify(args, algorithm: str) -> int:
     """校验模式入口"""
     source, target = validate_paths(args)
-    
+
     if args.verbose:
-        print(f"\n🔍 校验模式: 仅验证已存在文件，不拷贝")
+        print(f"\n🔍 校验模式: 仅验证已存在文件,不拷贝")
         print(f"🔐 哈希算法: {algorithm.upper()}")
 
     comparison = scan_and_compare(source, target, args.verbose)
@@ -1191,7 +1279,7 @@ def run_verify(args, algorithm: str) -> int:
 
     # 打印结果
     print_result_summary(result, args.verbose, Mode.VERIFY)
-    
+
     if only_in_source and args.verbose:
         print(f"\n⚠️ 仅存在于源文件夹: {len(only_in_source)} 个文件")
     if only_in_target and args.verbose:
@@ -1212,9 +1300,9 @@ _global_checkpoint = None
 def _signal_handler(signum, frame):
     """Ctrl+C 优雅中断处理"""
     global _global_checkpoint
-    print("\n\n⚠️ 检测到中断信号，正在保存进度...")
+    print("\n\n⚠️ 检测到中断信号,正在保存进度...")
     if _global_checkpoint:
-        _global_checkpoint.save_checkpoint(_global_checkpoint.state.get('current_file', ''), 
+        _global_checkpoint.save_checkpoint(_global_checkpoint.state.get('current_file', ''),
                                            _global_checkpoint.state.get('position', 0))
         print(f"✅ 进度已保存到: {_global_checkpoint.checkpoint_file}")
         print(f"💡 恢复命令: python3 check_sync_pro.py --resume {_global_checkpoint.checkpoint_file}")
@@ -1224,14 +1312,15 @@ def _signal_handler(signum, frame):
 def run_copy(args, algorithm: str) -> int:
     """拷贝模式入口"""
     global _global_checkpoint
-    
+
     source, target = validate_paths(args)
-    
+
     # 初始化进度和检查点管理器
     checkpoint_manager = None
     progress_manager = None
     should_resume = False
-    
+    pre_scanned_source_files = None  # 用于避免重复扫描
+
     if args.resume:
         # 从进度文件恢复
         resume_file = Path(args.resume)
@@ -1241,33 +1330,36 @@ def run_copy(args, algorithm: str) -> int:
             state = checkpoint_manager.state
             if state.get('current_file') or state.get('files'):
                 should_resume = True
-                print(f"🔄 检测到进度文件，将从断点继续...")
+                print(f"🔄 检测到进度文件,将从断点继续...", file=sys.stderr)
                 if state.get('current_file'):
-                    print(f"  继续文件: {state['current_file']} ({format_size(state.get('position', 0))})")
+                    print(f"  继续文件: {state['current_file']} ({format_size(state.get('position', 0))})", file=sys.stderr)
         else:
-            print(f"⚠️ 进度文件不存在: {resume_file}")
+            print(f"⚠️ 进度文件不存在: {resume_file}", file=sys.stderr)
     elif args.progress:
-        # 启用进度显示，创建空的检查点管理器
+        # 启用进度显示,创建空的检查点管理器
         checkpoint_manager = CheckpointManager(source, target, interval=args.checkpoint)
-    
-    # 创建共享进度管理器（用于总进度追踪）
+
+    # 扫描一次源文件夹,避免在 sync_single_pair 中重复扫描
+    scan_result = scan_and_compare(source, target, False)
+    pre_scanned_source_files = scan_result['source_files']
+
+    # 创建共享进度管理器(用于总进度追踪)
     if args.progress:
-        scan_result = scan_and_compare(source, target, False)
         files_to_copy_count = len(scan_result['only_source']) + len(scan_result['common'])
         total_size = sum(
-            scan_result['source_files'][f].stat().st_size 
+            scan_result['source_files'][f].stat().st_size
             for f in scan_result['only_source']
         ) + sum(
-            scan_result['source_files'][f].stat().st_size 
+            scan_result['source_files'][f].stat().st_size
             for f in scan_result['common']
         )
         progress_manager = ProgressManager(files_to_copy_count, total_size, enabled=True)
-    
+
     if checkpoint_manager:
         _global_checkpoint = checkpoint_manager
         # 设置信号处理
         signal.signal(signal.SIGINT, _signal_handler)
-    
+
     result = sync_single_pair(
         source=source,
         target=target,
@@ -1283,13 +1375,14 @@ def run_copy(args, algorithm: str) -> int:
         checkpoint_manager=checkpoint_manager,
         checkpoint_interval=args.checkpoint,
         resume=should_resume,
-        progress_manager=progress_manager
+        progress_manager=progress_manager,
+        pre_scanned_source_files=pre_scanned_source_files
     )
 
     result.project_name = args.project_name or target.name
     print_result_summary(result, args.verbose, Mode.COPY)
-    
-    # 清理检查点文件（拷贝完成）
+
+    # 清理检查点文件(拷贝完成)
     if checkpoint_manager:
         checkpoint_manager.cleanup()
         _global_checkpoint = None
@@ -1509,7 +1602,7 @@ def parse_args() -> argparse.Namespace:
   - 如未安装 xxhash,自动回退到 MD5
   - 双重校验会增加约 30%% 时间,但提供更高安全性
   - MHL 报告可被 Silverstack、YoYotta、DaVinci Resolve 等软件识别
-  - 断点续传在拷贝大文件时非常有用，笔记本休眠后可以从断点继续
+  - 断点续传在拷贝大文件时非常有用,笔记本休眠后可以从断点继续
 """
     )
 

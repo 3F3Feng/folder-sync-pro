@@ -481,6 +481,40 @@ a1b2c3d4e5f67890
 - 可选：xxhash（提升速度）
 - 可选：xattr（扩展属性保留，macOS）
 
+## 更新日志 / Changelog
+
+### v1.1.0 (2026-04-06)
+
+#### 命令行输出架构重构
+
+**P0 - 必须修复:**
+
+1. **统一 stdout/stderr 输出规则**
+   - INFO, SUCCESS 消息 → stdout
+   - WARNING, ERROR 消息 → stderr
+   - 进度条 → stdout (ANSI 控制)
+   - 警告消息（如 xxhash 未安装）现在明确输出到 stderr
+
+2. **修复 ProgressManager 状态机**
+   - 修复跳过文件时的进度条闪烁问题
+   - 跳过文件现在正确显示累积进度（文件数/总文件数）
+   - 添加 `skipped` 参数到 `start_file()` 方法
+   - 添加 `finalize()` 方法确保最后一个文件正确显示
+
+3. **消除重复扫描**
+   - `run_copy()` 中只扫描一次源文件夹
+   - `sync_single_pair()` 接受预扫描的源文件字典
+   - 避免重复 `scan_folder()` 调用
+
+**P1 - 重要改进:**
+
+4. **统一终端宽度获取**
+   - 添加全局常量 `TERMINAL_WIDTH`
+   - 移除重复的 `shutil.get_terminal_size()` 调用
+
+5. **清理裸 print() 语句**
+   - 警告消息现在明确使用 `file=sys.stderr`
+
 ## 许可证 / License
 
 MIT License

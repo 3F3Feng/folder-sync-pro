@@ -585,10 +585,15 @@ class TestProgressManager:
         assert pm.current_file_copied == 0
 
     def test_progress_manager_complete_file(self):
-        """Test completing a file"""
+        """Test completing a file - completion is deferred until next file starts or finalize"""
         pm = sync_pro.ProgressManager(total_files=10, total_bytes=1000, enabled=False)
         pm.start_file("test.txt", 100)
         pm.complete_file(100)
+        # Completion is pending until next file starts or finalize() is called
+        assert pm.completed_files == 0
+        assert pm.completed_bytes == 0
+        # Start next file to trigger the pending completion
+        pm.start_file("test2.txt", 100)
         assert pm.completed_files == 1
         assert pm.completed_bytes == 100
 
