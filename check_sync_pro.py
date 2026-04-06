@@ -961,6 +961,7 @@ def sync_single_pair(
         # 创建进度管理器（每个文件一个）
         if show_progress:
             progress_mgr = ProgressManager(1, source_size, enabled=True)
+            progress_mgr.start_file(rel_path, source_size)
         else:
             progress_mgr = None
 
@@ -1017,6 +1018,10 @@ def sync_single_pair(
         result.copied.append(rel_path)
         result.files.append(file_result)
         result.total_bytes += bytes_copied
+
+        # 更新进度管理器（标记文件完成）
+        if progress_mgr:
+            progress_mgr.complete_file(source_size)
         
         # 标记文件完成
         if checkpoint_manager:
