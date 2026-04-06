@@ -288,7 +288,7 @@ def _copy_and_hash_file(
         else: # current_target_size < source_size
             # Partial file exists, verify its integrity before resuming
             log_msg = log_callback if log_callback else (lambda m: print(m, file=sys.stderr))
-            log_msg(f"🔄 在 {target_path} 找到部分文件。正在校验 {format_size(current_target_size)}... ")
+            log_msg(f"🔄 在 {target_path} 找到未完成文件。正在校验 {format_size(current_target_size)}... ")
 
             # Hash the initial part of the source file
             source_partial_hash_func = get_hash_func(algorithm)
@@ -306,7 +306,7 @@ def _copy_and_hash_file(
                 target_partial_hash, _, _, _ = compute_file_hash(target_path, algorithm)
 
                 if source_partial_hash_func.hexdigest() == target_partial_hash:
-                    log_msg(f"✅ 完整性已确认。从 {format_size(current_target_size)} 恢复...")
+                    log_msg(f"✅ 完整性已确认。从 {format_size(current_target_size)} 继续...")
                     # The hash_func needs to be brought to the same state
                     hash_func = source_partial_hash_func
                     bytes_copied = current_target_size
