@@ -465,9 +465,13 @@ class ProgressManager:
         
     def complete_file(self, file_size: int):
         with self._lock:
+            import sys
+            old_completed = self.completed_files
+            old_bytes = self.completed_bytes
             self.completed_files += 1
             self.completed_bytes += file_size
             self.current_file_copied = file_size
+            print(f"DEBUG complete_file: was ({old_completed} files, {old_bytes} bytes), now ({self.completed_files} files, {self.completed_bytes} bytes)", file=sys.stderr)
             self._render_unlocked()
         
     def _render_unlocked(self):
@@ -479,6 +483,7 @@ class ProgressManager:
             return
         self.last_update = now
         
+        # For skipped files, current_file_copied equals file_size immediately, so we need to handle this
         # Total progress includes current file bytes (estimate remaining based on actual transfer speed)
         total_progress_bytes = self.completed_bytes + self.current_file_copied
         remaining_bytes = self.total_bytes - total_progress_bytes
