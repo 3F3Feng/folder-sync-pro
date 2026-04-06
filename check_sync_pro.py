@@ -486,6 +486,45 @@ def truncate_display_width(s: str, max_width: int) -> str:
     # ⚠️ 移除空格补齐！ANSI 的 \033[K 已经能完美清除残留，补齐空格会导致终端强制换行！
     return ''.join(res)
 
+def check_source_readonly(source: Path) -> Tuple[bool, str]:
+    """
+    检测源盘是否为只读（写保护）
+    防止 macOS 写入 .DS_Store 或 Spotlight 索引污染源数据
+
+    Returns:
+        (is_readonly, message)
+    """
+    import os
+    import stat
+
+    # 方法1：尝试创建测试文件检测写保护
+    test_file = source / ".folder_sync_write_test"
+    try:
+        test_file.touch()
+        test_file.unlink()  # 清理测试文件
+        is_readonly = False
+        status = ANSIColors.STATUS_WARN
+        msg = "源盘可写入，建议在拷贝前拨下写保护锁，防止污染源数据"
+    except (OSError, PermissionError):
+        is_readonly = True
+        status = ANSIColors.STATUS_OK
+        msg = "源盘为只读模式（写保护），源数据安全"
+
+    # 方法2：检查文件系统标志（备用）
+    if not is_readonly:
+        try:
+            root_stat = os.stat(source)
+            mode = root_stat.st_mode
+            if not (mode & stat.S_IWUSR):
+                is_readonly = True
+                status = ANSIColors.STATUS_OK
+                msg = "源盘无写入权限（可能是只读挂载），源数据安全"
+        except OSError:
+            pass
+
+    return is_readonly, f"{status} {msg}"
+
+
 def scan_folder(folder: Path, verbose: bool = False) -> Dict[str, Path]:
     """递归扫描文件夹,返回相对路径到完整路径的映射"""
     files = {}
@@ -1488,6 +1527,10 @@ def sync_single_pair(
         if checkpoint_manager:
             print(f"✓ 断点续传: 已启用 (每 {checkpoint_interval} 秒保存)")
         print()
+
+    # 检查源盘写保护状态
+    is_readonly, readonly_msg = check_source_readonly(source)
+    print(readonly_msg, file=sys.stderr)
 
     stats = {'bytes': 0, 'time': 0}
 
