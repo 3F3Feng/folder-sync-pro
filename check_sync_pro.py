@@ -37,6 +37,7 @@ import socket
 import sys
 import time
 import signal
+import threading
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -447,24 +448,29 @@ class ProgressManager:
         self.last_update = self.start_time
         self.enabled = enabled
         self.terminal_width = shutil.get_terminal_size((80, 20)).columns
+        self._lock = threading.Lock()
         
     def start_file(self, filename: str, file_size: int):
-        self.current_file = filename
-        self.current_file_size = file_size
-        self.current_file_copied = 0
-        self.file_start_time = time.time()
-        
+        with self._lock:
+            self.current_file = filename
+            self.current_file_size = file_size
+            self.current_file_copied = 0
+            self.file_start_time = time.time()
+            
     def update_file_progress(self, bytes_copied: int):
-        self.current_file_copied = bytes_copied
-        self._render()
+        with self._lock:
+            self.current_file_copied = bytes_copied
+            self._render_unlocked()
         
     def complete_file(self, file_size: int):
-        self.completed_files += 1
-        self.completed_bytes += file_size
-        self.current_file_copied = file_size
-        self._render()
+        with self._lock:
+            self.completed_files += 1
+            self.completed_bytes += file_size
+            self.current_file_copied = file_size
+            self._render_unlocked()
         
-    def _render(self):
+    def _render_unlocked(self):
+        """Internal render without lock - caller must hold lock"""
         if not self.enabled:
             return
         now = time.time()
@@ -488,12 +494,13 @@ class ProgressManager:
         total_bar = self._make_bar(total_pct, 20)
         file_bar = self._make_bar(file_pct, 20)
         
+        name_display = self.current_file[:20].ljust(20)
         if self.terminal_width >= 100:
             line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files) + " | " + format_size(self.completed_bytes) + "/" + format_size(self.total_bytes) + " | " + format_speed(self.completed_bytes, elapsed) + " | ETA: " + format_time(total_eta)
-            line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + self.current_file[:20].ljust(20) + " | " + format_size(self.current_file_copied) + "/" + format_size(self.current_file_size) + " | " + format_speed(self.current_file_copied, file_elapsed) + " | ETA: " + format_time(file_eta)
+            line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display + " | " + format_size(self.current_file_copied) + "/" + format_size(self.current_file_size) + " | " + format_speed(self.current_file_copied, file_elapsed) + " | ETA: " + format_time(file_eta)
         else:
             line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files) + " | " + format_speed(self.completed_bytes, elapsed)
-            line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + self.current_file[:20].ljust(20)
+            line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display
         
         # Use ANSI cursor control: move up 2 lines, clear lines, print new content
         output = chr(27) + "[2A" + chr(27) + "[K" + line1 + chr(10) + chr(27) + "[K" + line2 + chr(10)
@@ -878,7 +885,8 @@ def sync_single_pair(
     show_progress: bool = False,
     checkpoint_manager: Optional[CheckpointManager] = None,
     checkpoint_interval: int = 10,
-    resume: bool = False
+    resume: bool = False,
+    progress_manager: Optional[ProgressManager] = None
 ) -> SyncResult:
     """同步单个源-目标对"""
     target.mkdir(parents=True, exist_ok=True)
@@ -937,8 +945,8 @@ def sync_single_pair(
 
     stats = {'bytes': 0, 'time': 0}
     
-    # 初始化进度管理器（如果有）
-    progress_mgr = None
+    # Use shared progress_manager if provided, otherwise create per-file as fallback
+    shared_progress = progress_manager
 
     for idx, (rel_path, source_path) in enumerate(files_to_copy, 1):
         target_path = target / rel_path
@@ -958,12 +966,17 @@ def sync_single_pair(
             result.skipped.append(rel_path)
             continue
 
-        # 创建进度管理器（每个文件一个）
-        if show_progress:
-            progress_mgr = ProgressManager(1, source_size, enabled=True)
-            progress_mgr.start_file(rel_path, source_size)
+        # Use shared progress manager if provided, otherwise create per-file (backward compat)
+        if shared_progress:
+            shared_progress.start_file(rel_path, source_size)
+            progress_callback = shared_progress.update_file_progress
+        elif show_progress:
+            # Backward compat: per-file progress manager
+            per_file_pm = ProgressManager(1, source_size, enabled=True)
+            per_file_pm.start_file(rel_path, source_size)
+            progress_callback = per_file_pm.update_file_progress
         else:
-            progress_mgr = None
+            progress_callback = None
 
         source_hash, copy_time, bytes_copied, error = _copy_and_hash_file(
             source_path,
@@ -973,7 +986,7 @@ def sync_single_pair(
             preserve_metadata=preserve_metadata,
             preserve_xattr=preserve_xattr,
             checkpoint_manager=checkpoint_manager,
-            progress_callback=progress_mgr.update_file_progress if progress_mgr else None,
+            progress_callback=progress_callback,
             resume=resume or bool(checkpoint_manager) # Enable resume if checkpointing is on
         )
 
@@ -1020,8 +1033,10 @@ def sync_single_pair(
         result.total_bytes += bytes_copied
 
         # 更新进度管理器（标记文件完成）
-        if progress_mgr:
-            progress_mgr.complete_file(source_size)
+        if shared_progress:
+            shared_progress.complete_file(source_size)
+        elif show_progress:
+            per_file_pm.complete_file(source_size)
         
         # 标记文件完成
         if checkpoint_manager:
@@ -1220,6 +1235,13 @@ def run_copy(args, algorithm: str) -> int:
         # 启用进度显示，创建空的检查点管理器
         checkpoint_manager = CheckpointManager(source, target, interval=args.checkpoint)
     
+    # 创建共享进度管理器（用于总进度追踪）
+    if args.progress:
+        source_files = scan_folder(source, args.verbose)
+        files_to_copy_count = len(source_files)
+        total_size = sum(f.stat().st_size for f in source_files.values())
+        progress_manager = ProgressManager(files_to_copy_count, total_size, enabled=True)
+    
     if checkpoint_manager:
         _global_checkpoint = checkpoint_manager
         # 设置信号处理
@@ -1239,7 +1261,8 @@ def run_copy(args, algorithm: str) -> int:
         show_progress=args.progress,
         checkpoint_manager=checkpoint_manager,
         checkpoint_interval=args.checkpoint,
-        resume=should_resume
+        resume=should_resume,
+        progress_manager=progress_manager
     )
 
     result.project_name = args.project_name or target.name
