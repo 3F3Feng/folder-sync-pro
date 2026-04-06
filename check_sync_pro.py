@@ -49,7 +49,34 @@ from typing import Dict, List, Optional, Tuple, Callable
 from xml.dom import minidom
 
 # =============================================================================
-# 2. Constants & Enums
+# 2. ANSI 色彩定义
+# =============================================================================
+
+class ANSIColors:
+    """ANSI 终端色彩常量"""
+    RESET = "\033[0m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    WHITE_DIM = "\033[2m"
+    BOLD = "\033[1m"
+
+    # 状态图标（带颜色）
+    STATUS_OK = f"{GREEN}✅{RESET}"
+    STATUS_WARN = f"{YELLOW}⚠️{RESET}"
+    STATUS_ERROR = f"{RED}❌{RESET}"
+    STATUS_INFO = f"{CYAN}ℹ️{RESET}"
+    STATUS_PROGRESS = f"{BLUE}🔄{RESET}"
+
+    # 进度条颜色
+    PROGRESS_BAR_FILLED = f"{GREEN}"  # █ 绿色
+    PROGRESS_BAR_EMPTY = f"{WHITE_DIM}"  # ░ 暗白
+
+
+# =============================================================================
+# 3. Constants & Enums
 # =============================================================================
 
 # 尝试导入 xxhash,失败则回退到 hashlib
@@ -284,18 +311,18 @@ def _copy_and_hash_file(
             # File might be complete, verify hash
             # 加上 \033[2K\r 可以清除当前进度条的干扰
             log_msg = log_callback if log_callback else (lambda m: print(m, file=sys.stderr))
-            log_msg(f"✅ {display_path} 已存在且大小匹配，正在校验...")
+            log_msg(f"{ANSIColors.STATUS_OK} {display_path} 已存在且大小匹配，正在校验...")
             hash_val, _, _, err = compute_file_hash(target_path, algorithm)
             if not err:
                 # If hash matches, we can skip. Here we return the hash as if we copied it.
                 return hash_val, 0.0, source_size, ""
             else:
-                 log_msg(f"⚠️ 校验失败 ({err}), 正在重新复制...")
+                 log_msg(f"{ANSIColors.STATUS_WARN} 校验失败 ({err}), 正在重新复制...")
                  bytes_copied = 0
         else: # current_target_size < source_size
             # Partial file exists, verify its integrity before resuming
             log_msg = log_callback if log_callback else (lambda m: print(m, file=sys.stderr))
-            log_msg(f"🔄 在 {display_path} 找到未完成文件。正在校验 {format_size(current_target_size)}... ")
+            log_msg(f"{ANSIColors.STATUS_PROGRESS} 在 {display_path} 找到未完成文件。正在校验 {format_size(current_target_size)}... ")
 
             # Hash the initial part of the source file
             source_partial_hash_func = get_hash_func(algorithm)
@@ -313,15 +340,15 @@ def _copy_and_hash_file(
                 target_partial_hash, _, _, _ = compute_file_hash(target_path, algorithm)
 
                 if source_partial_hash_func.hexdigest() == target_partial_hash:
-                    log_msg(f"✅ 完整性已确认。从 {format_size(current_target_size)} 继续...")
+                    log_msg(f"{ANSIColors.STATUS_OK} 完整性已确认。从 {format_size(current_target_size)} 继续...")
                     # The hash_func needs to be brought to the same state
                     hash_func = source_partial_hash_func
                     bytes_copied = current_target_size
                 else:
-                    log_msg(f"⚠️ 部分文件已损坏。重新开始。")
+                    log_msg(f"{ANSIColors.STATUS_WARN} 部分文件已损坏。重新开始。")
                     bytes_copied = 0
             except (OSError, IOError) as e:
-                log_msg(f"⚠️ 无法验证部分文件 ({e}), 重新开始。")
+                log_msg(f"{ANSIColors.STATUS_WARN} 无法验证部分文件 ({e}), 重新开始。")
                 bytes_copied = 0
 
     # --- Copy Logic ---
@@ -715,7 +742,7 @@ class ProgressManager:
 
     def _make_bar(self, pct: float, length: int) -> str:
         filled = int(length * pct / 100)
-        return chr(9608) * filled + chr(9601) * (length - filled)
+        return f"{ANSIColors.PROGRESS_BAR_FILLED}{chr(9608) * filled}{ANSIColors.PROGRESS_BAR_EMPTY}{chr(9601) * (length - filled)}{ANSIColors.RESET}"
 
 
 class CheckpointManager:
@@ -734,7 +761,7 @@ class CheckpointManager:
                 with open(self.checkpoint_file, 'r') as f:
                     return json.load(f)
             except Exception as e:
-                print(f"⚠️ 无法加载进度文件 ({e}), 将从头开始.", file=sys.stderr)
+                print(f"{ANSIColors.STATUS_WARN} 无法加载进度文件 ({e}), 将从头开始.", file=sys.stderr)
 
         return {
             "session_id": f"sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
@@ -1134,7 +1161,7 @@ class ProgressDisplay:
     
     def _make_bar(self, pct: float, length: int) -> str:
         filled = int(length * pct / 100)
-        return chr(9608) * filled + chr(9601) * (length - filled)
+        return f"{ANSIColors.PROGRESS_BAR_FILLED}{chr(9608) * filled}{ANSIColors.PROGRESS_BAR_EMPTY}{chr(9601) * (length - filled)}{ANSIColors.RESET}"
 
 
 # =============================================================================
@@ -1183,13 +1210,13 @@ def validate_paths(args) -> Tuple[Path, Path]:
     target = Path(args.target).resolve()
 
     if not source.exists():
-        print(f"❌ 错误: 源路径不存在: {source}", file=sys.stderr)
+        print(f"{ANSIColors.STATUS_ERROR} 错误: 源路径不存在: {source}", file=sys.stderr)
         sys.exit(1)
     if not source.is_dir():
-        print(f"❌ 错误: 源路径不是文件夹: {source}", file=sys.stderr)
+        print(f"{ANSIColors.STATUS_ERROR} 错误: 源路径不是文件夹: {source}", file=sys.stderr)
         sys.exit(1)
     if source == target:
-        print(f"❌ 错误: 源路径和目标路径不能相同: {source}", file=sys.stderr)
+        print(f"{ANSIColors.STATUS_ERROR} 错误: 源路径和目标路径不能相同: {source}", file=sys.stderr)
         sys.exit(1)
 
     return source, target
@@ -1355,10 +1382,10 @@ def print_result_summary(result: SyncResult, verbose: bool = True, mode: Mode = 
     print(f"目标文件夹: {result.target}")
     print(f"哈希算法: {result.algorithm.upper()}")
     print()
-    print(f"✅ {success_text}: {len(result.copied)} 个文件")
+    print(f"{ANSIColors.STATUS_OK} {success_text}: {len(result.copied)} 个文件")
     if mode == Mode.COPY:
         print(f"⏭️ 跳过文件: {len(result.skipped)} 个文件")
-    print(f"❌ 失败文件: {len(result.failed)} 个文件")
+    print(f"{ANSIColors.STATUS_ERROR} 失败文件: {len(result.failed)} 个文件")
     print()
     print(f"📦 总数据量: {format_size(result.total_bytes)}")
     duration = result.end_time - result.start_time
@@ -1485,7 +1512,7 @@ def sync_single_pair(
         except OSError as e:
             result.failed.append(rel_path)
             if verbose:
-                log_msg(f"❌ 无法读取文件大小: {rel_path} ({e})")
+                log_msg(f"{ANSIColors.STATUS_ERROR} 无法读取文件大小: {rel_path} ({e})")
             continue
 
         if verbose and not show_progress:
@@ -1535,7 +1562,7 @@ def sync_single_pair(
         if error:
             result.failed.append(rel_path)
             if verbose:
-                log_msg(f"❌ 拷贝失败: {rel_path} ({error})")
+                log_msg(f"{ANSIColors.STATUS_ERROR} 拷贝失败: {rel_path} ({error})")
             # 保存失败前的进度
             if checkpoint_manager:
                 checkpoint_manager.save_checkpoint(rel_path, bytes_copied)
@@ -1729,7 +1756,7 @@ def run_verify(args, algorithm: str) -> int:
     if only_in_source and args.verbose:
         print(f"\n⚠️ 仅存在于源文件夹: {len(only_in_source)} 个文件")
     if only_in_target and args.verbose:
-        print(f"⚠️ 仅存在于目标文件夹: {len(only_in_target)} 个文件")
+        print(f"{ANSIColors.STATUS_WARN} 仅存在于目标文件夹: {len(only_in_target)} 个文件")
 
     # 生成报告
     if args.report:
@@ -1750,7 +1777,7 @@ def _signal_handler(signum, frame):
     if _global_checkpoint:
         _global_checkpoint.save_checkpoint(_global_checkpoint.state.get('current_file', ''),
                                            _global_checkpoint.state.get('position', 0))
-        print(f"✅ 进度已保存到: {_global_checkpoint.checkpoint_file}")
+        print(f"{ANSIColors.STATUS_OK} 进度已保存到: {_global_checkpoint.checkpoint_file}")
         print(f"💡 恢复命令: python3 check_sync_pro.py --resume {_global_checkpoint.checkpoint_file}")
     sys.exit(1)
 
@@ -1776,11 +1803,11 @@ def run_copy(args, algorithm: str) -> int:
             state = checkpoint_manager.state
             if state.get('current_file') or state.get('files'):
                 should_resume = True
-                print(f"🔄 检测到进度文件,将从断点继续...", file=sys.stderr)
+                print(f"{ANSIColors.STATUS_PROGRESS} 检测到进度文件,将从断点继续...", file=sys.stderr)
                 if state.get('current_file'):
                     print(f"  继续文件: {state['current_file']} ({format_size(state.get('position', 0))})", file=sys.stderr)
         else:
-            print(f"⚠️ 进度文件不存在: {resume_file}", file=sys.stderr)
+            print(f"{ANSIColors.STATUS_WARN} 进度文件不存在: {resume_file}", file=sys.stderr)
     elif args.progress:
         # 启用进度显示,创建空的检查点管理器
         checkpoint_manager = CheckpointManager(source, target, interval=args.checkpoint)
@@ -1859,10 +1886,10 @@ def run_multi_source(args, algorithm: str) -> int:
     # 验证源路径
     for source in sources:
         if not source.exists():
-            print(f"❌ 错误: 源路径不存在: {source}", file=sys.stderr)
+            print(f"{ANSIColors.STATUS_ERROR} 错误: 源路径不存在: {source}", file=sys.stderr)
             return 1
         if not source.is_dir():
-            print(f"❌ 错误: 源路径不是文件夹: {source}", file=sys.stderr)
+            print(f"{ANSIColors.STATUS_ERROR} 错误: 源路径不是文件夹: {source}", file=sys.stderr)
             return 1
 
     source_target_pairs = [(s, t) for s in sources for t in targets]
@@ -1924,7 +1951,7 @@ def run_multi_source(args, algorithm: str) -> int:
                         status = "✅" if not result.failed else "❌"
                         print(f"{status} 完成: {source.name} → {target.name} ({len(result.copied)} 个文件)")
                 except Exception as e:
-                    print(f"❌ 错误: {source.name} → {target.name}: {e}", file=sys.stderr)
+                    print(f"{ANSIColors.STATUS_ERROR} 错误: {source.name} → {target.name}: {e}", file=sys.stderr)
                     has_unexpected_errors = True
 
     multi_result.end_time = time.time()
@@ -1939,9 +1966,9 @@ def run_multi_source(args, algorithm: str) -> int:
         total_skipped = sum(len(r.skipped) for r in multi_result.results)
         total_bytes = sum(r.total_bytes for r in multi_result.results)
         print(f"\n总任务数: {len(multi_result.results)}")
-        print(f"✅ 成功拷贝: {total_copied} 个文件")
+        print(f"{ANSIColors.STATUS_OK} 成功拷贝: {total_copied} 个文件")
         print(f"⏭️ 跳过文件: {total_skipped} 个文件")
-        print(f"❌ 失败文件: {total_failed} 个文件")
+        print(f"{ANSIColors.STATUS_ERROR} 失败文件: {total_failed} 个文件")
         print(f"\n📦 总数据量: {format_size(total_bytes)}")
         duration = multi_result.end_time - multi_result.start_time
         print(f"⏱️ 总耗时: {duration:.1f} 秒")
