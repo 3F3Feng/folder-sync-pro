@@ -417,10 +417,10 @@ def verify_file_hash(
                         progress_msg = f"🔍 校验中: [{name_part:<30}] {bar} {pct:5.1f}% | {speed_str:>10} | ETA: {format_time(eta_seconds):>6}"
 
                         safe_msg = truncate_display_width(progress_msg, terminal_width - 1)
-                        sys.stdout.write(f"\r{safe_msg}")
+                        sys.stdout.write(f"\r\033[K{safe_msg}")
                         sys.stdout.flush()
 
-            sys.stdout.write(f"\r{' ' * (terminal_width - 1)}\r")
+            sys.stdout.write("\r\033[K")
             sys.stdout.flush()
 
             actual_hash = hash_func.hexdigest()
@@ -677,10 +677,12 @@ class ProgressManager:
         speed = format_speed(stats.get('bytes', 0), stats.get('time', 1))
         
         # Dynamically get terminal width
-        terminal_width = shutil.get_terminal_size((80, 20)).columns
+        terminal_width = get_terminal_width()
         progress_line = f"[{bar}] {pct:5.1f}% ({current}/{total}) | {speed} | {display_name}"
         
-        sys.stdout.write(f"\r{progress_line.ljust(terminal_width)}")
+        # Truncate instead of ljust to avoid terminal auto-wrap
+        safe_line = truncate_display_width(progress_line, terminal_width - 1)
+        sys.stdout.write(f"\r\033[K{safe_line}")
         sys.stdout.flush()
         
         if current >= total:
@@ -1142,10 +1144,9 @@ def print_progress(current: int, total: int, current_file: str, stats: dict):
 
     progress_line = f"[{bar}] {pct:5.1f}% ({current}/{total}) | {speed} | {display_name}"
 
-    # 动态获取终端宽度
-    terminal_width = get_terminal_width()
-    # Pad with spaces to clear the line
-    sys.stdout.write(f"\r{progress_line.ljust(terminal_width)}")
+    # Truncate instead of ljust to avoid terminal auto-wrap
+    safe_line = truncate_display_width(progress_line, get_terminal_width() - 1)
+    sys.stdout.write(f"\r\033[K{safe_line}")
     sys.stdout.flush()
 
     if current >= total:
@@ -1471,7 +1472,7 @@ def sync_single_pair(
         except OSError as e:
             result.failed.append(rel_path)
             if verbose:
-                print(f"\n❌ 无法读取文件大小: {rel_path} ({e})")
+                log_msg(f"❌ 无法读取文件大小: {rel_path} ({e})")
             continue
 
         if verbose and not show_progress:
@@ -1493,14 +1494,17 @@ def sync_single_pair(
         if shared_progress:
             shared_progress.start_file(rel_path, source_size, skipped=False)
             progress_callback = shared_progress.update_file_progress
+            log_cb = shared_progress.print_message
         elif show_progress:
             # Backward compat: per-file progress manager
             per_file_pm = ProgressManager(1, source_size, enabled=True)
             per_file_pm.start_file(rel_path, source_size, skipped=False)
             progress_callback = per_file_pm.update_file_progress
             last_per_file_pm = per_file_pm
+            log_cb = per_file_pm.print_message
         else:
             progress_callback = None
+            log_cb = lambda m: print(m, file=sys.stderr)
 
         source_hash, copy_time, bytes_copied, error = _copy_and_hash_file(
             source_path,
@@ -1511,14 +1515,14 @@ def sync_single_pair(
             preserve_xattr=preserve_xattr,
             checkpoint_manager=checkpoint_manager,
             progress_callback=progress_callback,
-            resume=resume or bool(checkpoint_manager), # Enable resume if checkpointing is on
-            log_callback=log_msg
+            resume=resume or bool(checkpoint_manager),
+            log_callback=log_cb
         )
 
         if error:
             result.failed.append(rel_path)
             if verbose:
-                print(f"\n❌ 拷贝失败: {rel_path} ({error})")
+                log_msg(f"❌ 拷贝失败: {rel_path} ({error})")
             # 保存失败前的进度
             if checkpoint_manager:
                 checkpoint_manager.save_checkpoint(rel_path, bytes_copied)
