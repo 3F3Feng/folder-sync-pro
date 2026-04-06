@@ -218,17 +218,17 @@ def _copy_and_hash_file(
                 return "", time.time() - start_time, 0, f"Failed to delete corrupted target file: {e}"
         elif current_target_size == source_size:
             # File might be complete, verify hash
-            print(f"✅ File exists and size matches. Verifying hash...")
+            print(f"✅ File exists and size matches. Verifying hash...", file=sys.stderr)
             hash_val, _, _, err = compute_file_hash(target_path, algorithm)
             if not err:
                 # If hash matches, we can skip. Here we return the hash as if we copied it.
                 return hash_val, 0.0, source_size, "" 
             else:
-                 print(f"⚠️ Verification failed ({err}), re-copying.")
+                 print(f"⚠️ Verification failed ({err}), re-copying.", file=sys.stderr)
                  bytes_copied = 0
         else: # current_target_size < source_size
             # Partial file exists, verify its integrity before resuming
-            print(f"🔄 Partial file found. Verifying {format_size(current_target_size)}... ")
+            print(f"🔄 Partial file found. Verifying {format_size(current_target_size)}... ", file=sys.stderr)
             
             # Hash the initial part of the source file
             source_partial_hash_func = get_hash_func(algorithm)
@@ -246,15 +246,15 @@ def _copy_and_hash_file(
                 target_partial_hash, _, _, _ = compute_file_hash(target_path, algorithm)
 
                 if source_partial_hash_func.hexdigest() == target_partial_hash:
-                    print(f"✅ Integrity confirmed. Resuming from {format_size(current_target_size)}")
+                    print(f"✅ Integrity confirmed. Resuming from {format_size(current_target_size)}", file=sys.stderr)
                     # The hash_func needs to be brought to the same state
                     hash_func = source_partial_hash_func
                     bytes_copied = current_target_size
                 else:
-                    print(f"⚠️ Partial file is corrupt. Starting over.")
+                    print(f"⚠️ Partial file is corrupt. Starting over.", file=sys.stderr)
                     bytes_copied = 0
             except (OSError, IOError) as e:
-                print(f"⚠️ Could not verify partial file ({e}), starting over.")
+                print(f"⚠️ Could not verify partial file ({e}), starting over.", file=sys.stderr)
                 bytes_copied = 0
     
     # --- Copy Logic ---
