@@ -960,7 +960,7 @@ def sync_single_pair(
 
         # 创建进度管理器（每个文件一个）
         if show_progress:
-            progress_mgr = ProgressManager(source_size, rel_path, enabled=True)
+            progress_mgr = ProgressManager(1, source_size, enabled=True)
         else:
             progress_mgr = None
 
