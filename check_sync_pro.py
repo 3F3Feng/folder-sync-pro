@@ -1415,10 +1415,8 @@ def sync_single_pair(
 
         if target_path.exists() and skip_existing:
             result.skipped.append(rel_path)
-            if shared_progress:
-                # Use skipped=True to prevent flicker (file already complete)
-                shared_progress.start_file(rel_path, source_size, skipped=True)
-                shared_progress.complete_file(source_size)
+            # Skip progress tracking entirely for existing files
+            # They don't contribute meaningfully to transfer progress
             continue
 
         # Use shared progress manager if provided, otherwise create per-file (backward compat)
