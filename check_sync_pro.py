@@ -479,12 +479,16 @@ class ProgressManager:
             return
         self.last_update = now
         
-        total_pct = (self.completed_bytes / self.total_bytes * 100) if self.total_bytes > 0 else 100
+        # Total progress includes current file bytes (estimate remaining based on actual transfer speed)
+        total_progress_bytes = self.completed_bytes + self.current_file_copied
+        remaining_bytes = self.total_bytes - total_progress_bytes
+        total_pct = (total_progress_bytes / self.total_bytes * 100) if self.total_bytes > 0 else 100
         file_pct = (self.current_file_copied / self.current_file_size * 100) if self.current_file_size > 0 else 100
         
         elapsed = now - self.start_time
-        avg_speed = self.completed_bytes / elapsed if elapsed > 0 else 0
-        remaining_bytes = self.total_bytes - self.completed_bytes
+        # Use actual transfer speed (based on total elapsed time, not just completed bytes)
+        # This includes current file progress for accurate ETA
+        avg_speed = total_progress_bytes / elapsed if elapsed > 0 else 0
         total_eta = remaining_bytes / avg_speed if avg_speed > 0 else 0
         
         file_elapsed = now - self.file_start_time
@@ -1242,9 +1246,8 @@ def run_copy(args, algorithm: str) -> int:
     
     # 创建共享进度管理器（用于总进度追踪）
     if args.progress:
-        source_files = scan_folder(source, args.verbose)
-        files_to_copy_count = len(source_files)
-        total_size = sum(f.stat().st_size for f in source_files.values())
+        # Note: scan_folder is called again inside sync_single_pair, but that's needed for file list
+        source_files, files_to_copy_count, total_size, _ = scan_folder(source, False)
         progress_manager = ProgressManager(files_to_copy_count, total_size, enabled=True)
     
     if checkpoint_manager:
