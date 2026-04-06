@@ -266,6 +266,13 @@ def _copy_and_hash_file(
     # --- Resume Logic ---
     if resume and target_path.exists():
         current_target_size = target_path.stat().st_size
+        if checkpoint_manager and hasattr(checkpoint_manager, 'target'):
+            try:
+                display_path = str(target_path.relative_to(checkpoint_manager.target))
+            except ValueError:
+                display_path = target_path.name
+        else:
+            display_path = target_path.name
         if current_target_size > source_size:
             # Corrupted target, start from scratch
             try:
@@ -277,7 +284,7 @@ def _copy_and_hash_file(
             # File might be complete, verify hash
             # 加上 \033[2K\r 可以清除当前进度条的干扰
             log_msg = log_callback if log_callback else (lambda m: print(m, file=sys.stderr))
-            log_msg(f"✅ {target_path.relative_to(checkpoint_manager.target)} 已存在且大小匹配，正在校验...")
+            log_msg(f"✅ {display_path} 已存在且大小匹配，正在校验...")
             hash_val, _, _, err = compute_file_hash(target_path, algorithm)
             if not err:
                 # If hash matches, we can skip. Here we return the hash as if we copied it.
@@ -288,7 +295,7 @@ def _copy_and_hash_file(
         else: # current_target_size < source_size
             # Partial file exists, verify its integrity before resuming
             log_msg = log_callback if log_callback else (lambda m: print(m, file=sys.stderr))
-            log_msg(f"🔄 在 {target_path.relative_to(checkpoint_manager.target)} 找到未完成文件。正在校验 {format_size(current_target_size)}... ")
+            log_msg(f"🔄 在 {display_path} 找到未完成文件。正在校验 {format_size(current_target_size)}... ")
 
             # Hash the initial part of the source file
             source_partial_hash_func = get_hash_func(algorithm)
