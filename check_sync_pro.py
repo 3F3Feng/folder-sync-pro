@@ -277,7 +277,7 @@ def _copy_and_hash_file(
             # File might be complete, verify hash
             # 加上 \033[2K\r 可以清除当前进度条的干扰
             log_msg = log_callback if log_callback else (lambda m: print(m, file=sys.stderr))
-            log_msg(f"✅ {target_path.name} 已存在且大小匹配，正在校验...")
+            log_msg(f"✅ {target_path.relative_to(checkpoint_manager.target)} 已存在且大小匹配，正在校验...")
             hash_val, _, _, err = compute_file_hash(target_path, algorithm)
             if not err:
                 # If hash matches, we can skip. Here we return the hash as if we copied it.
@@ -288,7 +288,7 @@ def _copy_and_hash_file(
         else: # current_target_size < source_size
             # Partial file exists, verify its integrity before resuming
             log_msg = log_callback if log_callback else (lambda m: print(m, file=sys.stderr))
-            log_msg(f"🔄 在 {target_path} 找到未完成文件。正在校验 {format_size(current_target_size)}... ")
+            log_msg(f"🔄 在 {target_path.relative_to(checkpoint_manager.target)} 找到未完成文件。正在校验 {format_size(current_target_size)}... ")
 
             # Hash the initial part of the source file
             source_partial_hash_func = get_hash_func(algorithm)
@@ -1071,6 +1071,10 @@ class ProgressDisplay:
         file_speed = self.current_file_copied / file_elapsed if file_elapsed > 0 else 0
         remaining_file_bytes = self.current_file_size - self.current_file_copied
         file_eta = remaining_file_bytes / file_speed if file_speed > 0 else 0
+
+        if remaining_bytes <= 0 or self.completed_bytes >= self.total_bytes:
+            total_eta = 0
+            file_eta = 0
 
         total_bar = self._make_bar(total_pct, 20)
         file_bar = self._make_bar(file_pct, 20)
