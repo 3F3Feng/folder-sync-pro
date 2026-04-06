@@ -273,7 +273,7 @@ def _copy_and_hash_file(
                 return "", time.time() - start_time, 0, f"Failed to delete corrupted target file: {e}"
         elif current_target_size == source_size:
             # File might be complete, verify hash
-            print(f"✅ File exists and size matches. Verifying hash...", file=sys.stderr)
+            print(f"✅ {target_path} exists and size matches. Verifying hash...", file=sys.stderr)
             hash_val, _, _, err = compute_file_hash(target_path, algorithm)
             if not err:
                 # If hash matches, we can skip. Here we return the hash as if we copied it.
@@ -283,7 +283,7 @@ def _copy_and_hash_file(
                  bytes_copied = 0
         else: # current_target_size < source_size
             # Partial file exists, verify its integrity before resuming
-            print(f"🔄 Partial file found. Verifying {format_size(current_target_size)}... ")
+            print(f"🔄 Partial file found at {target_path}. Verifying {format_size(current_target_size)}... ")
 
             # Hash the initial part of the source file
             source_partial_hash_func = get_hash_func(algorithm)
@@ -514,15 +514,16 @@ class ProgressManager:
     def start_file(self, filename: str, file_size: int, skipped: bool = False):
         """Start tracking a new file. Use skipped=True to mark file as already complete (no render)."""
         with self._lock:
-            # If there was a previous file that just completed, apply its completion counters and render
+            # If there was a previous file that just completed, apply its completion counters
             if self._pending_file:
-                # Apply the pending completion counters before rendering
                 self.completed_files += self._pending_completed_files
                 self.completed_bytes += self._pending_completed_bytes
                 self._pending_completed_files = 0
                 self._pending_completed_bytes = 0
-                # Pass the pending skip flag to render
-                self._render_unlocked(final=True, skipped=self._pending_skip_current_file)
+                # Only render if the previous file was NOT skipped (had actual progress)
+                # or if this is not the first file we ever started
+                if not self._pending_skip_current_file or not self._first_render:
+                    self._render_unlocked(final=True)
                 self._pending_file = False
 
             self.current_file = filename
