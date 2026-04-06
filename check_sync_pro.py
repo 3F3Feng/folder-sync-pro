@@ -38,6 +38,7 @@ import sys
 import time
 import signal
 import threading
+import unicodedata
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -248,6 +249,7 @@ def _copy_and_hash_file(
     checkpoint_manager: Optional[CheckpointManager] = None,
     progress_callback: Optional[Callable[[int], None]] = None,
     resume: bool = False,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[str, float, int, str]:
     """
     Copies a file with streaming hash calculation, retries, and resume support.
@@ -270,20 +272,23 @@ def _copy_and_hash_file(
                 target_path.unlink()
                 bytes_copied = 0
             except OSError as e:
-                return "", time.time() - start_time, 0, f"Failed to delete corrupted target file: {e}"
+                return "", time.time() - start_time, 0, f"删除目标文件失败: {e}"
         elif current_target_size == source_size:
             # File might be complete, verify hash
-            print(f"✅ {target_path} exists and size matches. Verifying hash...", file=sys.stderr)
+            # 加上 \033[2K\r 可以清除当前进度条的干扰
+            log_msg = log_callback if log_callback else (lambda m: print(m, file=sys.stderr))
+            log_msg(f"✅ {target_path.name} 已存在且大小匹配，正在校验...")
             hash_val, _, _, err = compute_file_hash(target_path, algorithm)
             if not err:
                 # If hash matches, we can skip. Here we return the hash as if we copied it.
                 return hash_val, 0.0, source_size, ""
             else:
-                 print(f"⚠️ Verification failed ({err}), re-copying.", file=sys.stderr)
+                 log_msg(f"⚠️ 校验失败 ({err}), 正在重新复制...")
                  bytes_copied = 0
         else: # current_target_size < source_size
             # Partial file exists, verify its integrity before resuming
-            print(f"🔄 Partial file found at {target_path}. Verifying {format_size(current_target_size)}... ")
+            log_msg = log_callback if log_callback else (lambda m: print(m, file=sys.stderr))
+            log_msg(f"🔄 在 {target_path} 找到部分文件。正在校验 {format_size(current_target_size)}... ")
 
             # Hash the initial part of the source file
             source_partial_hash_func = get_hash_func(algorithm)
@@ -301,15 +306,15 @@ def _copy_and_hash_file(
                 target_partial_hash, _, _, _ = compute_file_hash(target_path, algorithm)
 
                 if source_partial_hash_func.hexdigest() == target_partial_hash:
-                    print(f"✅ Integrity confirmed. Resuming from {format_size(current_target_size)}")
+                    log_msg(f"✅ 完整性已确认。从 {format_size(current_target_size)} 恢复...")
                     # The hash_func needs to be brought to the same state
                     hash_func = source_partial_hash_func
                     bytes_copied = current_target_size
                 else:
-                    print(f"⚠️ Partial file is corrupt. Starting over.", file=sys.stderr)
+                    log_msg(f"⚠️ 部分文件已损坏。重新开始。")
                     bytes_copied = 0
             except (OSError, IOError) as e:
-                print(f"⚠️ Could not verify partial file ({e}), starting over.", file=sys.stderr)
+                log_msg(f"⚠️ 无法验证部分文件 ({e}), 重新开始。")
                 bytes_copied = 0
 
     # --- Copy Logic ---
@@ -409,16 +414,13 @@ def verify_file_hash(
                         name_part = (file_name[:30] + "..") if len(file_name) > 30 else file_name
                         if not name_part: name_part = file_path.name
 
-                        progress_msg = f"🔍 Verifying: [{name_part:<30}] {bar} {pct:5.1f}% | {speed_str:>10} | ETA: {format_time(eta_seconds):>6}"
+                        progress_msg = f"🔍 校验中: [{name_part:<30}] {bar} {pct:5.1f}% | {speed_str:>10} | ETA: {format_time(eta_seconds):>6}"
 
-                        # Pad with spaces to clear the line
-                        sys.stdout.write(f"\r{progress_msg.ljust(terminal_width)}")
+                        safe_msg = truncate_display_width(progress_msg, terminal_width - 1)
+                        sys.stdout.write(f"\r{safe_msg}")
                         sys.stdout.flush()
-                        last_update_time = now
-                        last_update_bytes = bytes_read
 
-            # Clear the line on completion
-            sys.stdout.write(f"\r{' '.ljust(terminal_width)}\r")
+            sys.stdout.write(f"\r{' ' * (terminal_width - 1)}\r")
             sys.stdout.flush()
 
             actual_hash = hash_func.hexdigest()
@@ -436,6 +438,19 @@ def verify_file_hash(
 # =============================================================================
 # 5. Utility Functions (格式化、扫描)
 # =============================================================================
+
+def truncate_display_width(s: str, max_width: int) -> str:
+    """根据终端视觉宽度（中文字符占2位）截断字符串，绝不触发终端自动换行。配合 ANSI Clear Line 使用无需补齐空格。"""
+    width = 0
+    res = []
+    for c in s:
+        w = 2 if unicodedata.east_asian_width(c) in 'WF' else 1
+        if width + w > max_width:
+            break
+        width += w
+        res.append(c)
+    # ⚠️ 移除空格补齐！ANSI 的 \033[K 已经能完美清除残留，补齐空格会导致终端强制换行！
+    return ''.join(res)
 
 def scan_folder(folder: Path, verbose: bool = False) -> Dict[str, Path]:
     """递归扫描文件夹,返回相对路径到完整路径的映射"""
@@ -637,18 +652,18 @@ class ProgressManager:
             line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files)
             line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display
 
-        # Ensure output fits within terminal width to avoid wrap issues
-        line1 = line1[:terminal_width].ljust(terminal_width)
-        line2 = line2[:terminal_width].ljust(terminal_width)
+        # Use truncate_display_width instead of ljust to avoid terminal auto-wrap
+        line1_trunc = truncate_display_width(line1, terminal_width)
+        line2_trunc = truncate_display_width(line2, terminal_width)
         
         # Use ANSI cursor control: move up 2 lines, clear lines, print new content
         if self._first_render:
-            # First render: just print, don't try to clear previous lines
-            output = line1 + chr(10) + chr(27) + "[K" + line2 + chr(10)
+            # First render: just print, use \033[K to clear current line
+            output = f"\r\033[K{line1_trunc}\n\r\033[K{line2_trunc}\n"
             self._first_render = False
         else:
-            # Subsequent renders: move up 2 lines and overwrite
-            output = chr(27) + "[2A" + chr(27) + "[K" + line1 + chr(10) + chr(27) + "[K" + line2 + chr(10)
+            # Subsequent renders: move up 2 lines, clear and overwrite
+            output = f"\033[2A\r\033[K{line1_trunc}\n\r\033[K{line2_trunc}\n"
         sys.stdout.write(output)
         sys.stdout.flush()
 
@@ -671,6 +686,21 @@ class ProgressManager:
         if current >= total:
             sys.stdout.write("\n")
             sys.stdout.flush()
+
+    def print_message(self, msg: str):
+        """安全地在进度条运行期间打印消息，防止游标错乱"""
+        with self._lock:
+            if self.enabled and not self._first_render:
+                # 向上移动到进度条起点，并清除屏幕下方所有内容
+                sys.stdout.write("\033[2A\r\033[J")
+                sys.stdout.flush()
+            
+            # 打印消息（自带换行）
+            print(msg, file=sys.stderr)
+            
+            # 强制下一次渲染为"首次渲染"，从而把进度条画在消息的下方
+            if self.enabled:
+                self._first_render = True
 
     def _make_bar(self, pct: float, length: int) -> str:
         filled = int(length * pct / 100)
@@ -973,7 +1003,25 @@ class ProgressDisplay:
             self._pending_completed_bytes = file_size
             self._pending_file = True
             self._pending_skip_current_file = False
-    
+
+    def print_message(self, msg: str):
+        """安全地在进度条运行期间打印消息，防止游标错乱"""
+        with self._lock:
+            if self.enabled and not self._first_render:
+                # 向上移动到进度条起点，并清除屏幕下方所有内容
+                if self.dual_line:
+                    sys.stdout.write("\033[2A\r\033[J")
+                else:
+                    sys.stdout.write("\033[1A\r\033[J")
+                sys.stdout.flush()
+            
+            # 打印消息（自带换行）
+            print(msg, file=sys.stderr)
+            
+            # 强制下一次渲染为“首次渲染”，从而把进度条画在消息的下方
+            if self.enabled:
+                self._first_render = True
+
     def finalize(self):
         """结束进度显示"""
         with self._lock:
@@ -1030,18 +1078,26 @@ class ProgressDisplay:
         
         if self.dual_line:
             # 双行模式
+            safe_width = terminal_width - 1  # 预留1个字符缓冲，绝对防止边缘换行
+            
             if terminal_width >= 100:
-                line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files) + " | " + format_size(self.completed_bytes) + "/" + format_size(self.total_bytes) + " | ETA: " + format_time(total_eta)
-                line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display + " | " + format_size(self.current_file_copied) + "/" + format_size(self.current_file_size) + " | " + format_speed(self.current_file_copied, file_elapsed) + " | ETA: " + format_time(file_eta)
+                l1 = f"总进度: {total_bar} {total_pct:5.1f}% | {self.completed_files}/{self.total_files} | {format_size(self.completed_bytes)}/{format_size(self.total_bytes)} | ETA: {format_time(total_eta)}"
+                l2 = f"当前:   {file_bar} {file_pct:5.1f}% | {name_display} | {format_size(self.current_file_copied)}/{format_size(self.current_file_size)} | {format_speed(self.current_file_copied, file_elapsed)} | ETA: {format_time(file_eta)}"
             else:
-                line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files)
-                line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display
+                l1 = f"总进度: {total_bar} {total_pct:5.1f}% | {self.completed_files}/{self.total_files}"
+                l2 = f"当前:   {file_bar} {file_pct:5.1f}% | {name_display}"
+
+            # 严格按照视觉宽度截断，杜绝换行
+            line1 = truncate_display_width(l1, safe_width)
+            line2 = truncate_display_width(l2, safe_width)
 
             if self._first_render:
-                output = line1 + chr(10) + chr(27) + "[K" + line2 + chr(10)
+                # 首次渲染也用 \033[K 清理当前行可能存在的乱码
+                output = f"\r\033[K{line1}\n\r\033[K{line2}\n"
                 self._first_render = False
             else:
-                output = chr(27) + "[2A" + chr(27) + "[K" + line1 + chr(10) + chr(27) + "[K" + line2 + chr(10)
+                # 向上2行 -> 清除并写入 -> 换行 -> 清除并写入 -> 换行
+                output = f"\033[2A\r\033[K{line1}\n\r\033[K{line2}\n"
         else:
             # 单行模式
             display_name = name_display.strip()
@@ -1397,6 +1453,15 @@ def sync_single_pair(
     # Use shared progress_manager if provided, otherwise create per-file as fallback
     shared_progress = progress_manager
     last_per_file_pm = None  # Track last per-file progress manager for backward compat
+    
+    # Define log_msg wrapper for safe logging during progress
+    def log_msg(msg: str):
+        if shared_progress:
+            shared_progress.print_message(msg)
+        elif show_progress and last_per_file_pm:
+            last_per_file_pm.print_message(msg)
+        else:
+            print(msg, file=sys.stderr)
 
     for idx, (rel_path, source_path) in enumerate(files_to_copy, 1):
         target_path = target / rel_path
@@ -1446,7 +1511,8 @@ def sync_single_pair(
             preserve_xattr=preserve_xattr,
             checkpoint_manager=checkpoint_manager,
             progress_callback=progress_callback,
-            resume=resume or bool(checkpoint_manager) # Enable resume if checkpointing is on
+            resume=resume or bool(checkpoint_manager), # Enable resume if checkpointing is on
+            log_callback=log_msg
         )
 
         if error:
