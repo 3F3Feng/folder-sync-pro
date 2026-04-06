@@ -1003,7 +1003,67 @@ class OutputManager:
 
 
 # =============================================================================
-# 4c. ProgressDisplay Class (统一进度显示)
+# 4c. AuditLogger Class (审计日志)
+# =============================================================================
+class AuditLogger:
+    """
+    审计日志：同时输出到 stdout 和日志文件
+    用于 DIT 交付时的"铁证"记录
+    """
+    def __init__(self, log_path: Path, enabled: bool = True):
+        self.log_path = log_path
+        self.enabled = enabled
+        self._lock = threading.Lock()
+        
+        if self.enabled:
+            # 写入日志头
+            with open(self.log_path, 'a', encoding='utf-8') as f:
+                f.write("\n" + "=" * 80 + "\n")
+                f.write(f"folder-sync-pro Audit Log\n")
+                f.write(f"Started: {datetime.now().isoformat()}\n")
+                f.write("=" * 80 + "\n\n")
+
+    def log(self, message: str, level: str = "INFO"):
+        """记录日志"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_line = f"[{timestamp}] [{level}] {message}"
+        
+        # 打印到 stderr
+        print(log_line, file=sys.stderr)
+        
+        # 写入文件
+        if self.enabled:
+            with self._lock:
+                with open(self.log_path, 'a', encoding='utf-8') as f:
+                    f.write(log_line + "\n")
+
+    def log_file_start(self, rel_path: str, size: int):
+        self.log(f"开始拷贝: {rel_path} ({format_size(size)})")
+
+    def log_file_complete(self, rel_path: str, hash_val: str, duration: float):
+        self.log(f"完成: {rel_path} | Hash: {hash_val} | 耗时: {duration:.1f}s")
+
+    def log_file_skip(self, rel_path: str, reason: str = "已存在"):
+        self.log(f"跳过: {rel_path} ({reason})")
+
+    def log_file_error(self, rel_path: str, error: str):
+        self.log(f"错误: {rel_path} | {error}", "ERROR")
+
+    def log_summary(self, total_files: int, successful: int, skipped: int, failed: int, total_bytes: int, elapsed_time: float):
+        """写入汇总信息"""
+        self.log("", "INFO")
+        self.log("=" * 40 + " SUMMARY " + "=" * 39, "INFO")
+        self.log(f"总文件数: {total_files}", "INFO")
+        self.log(f"成功: {successful} | 跳过: {skipped} | 失败: {failed}", "INFO")
+        self.log(f"总大小: {format_size(total_bytes)}", "INFO")
+        self.log(f"总耗时: {elapsed_time:.1f}s", "INFO")
+        self.log(f"平均速度: {format_speed(total_bytes, elapsed_time)}", "INFO")
+        self.log("=" * 80, "INFO")
+        self.log(f"Completed: {datetime.now().isoformat()}", "INFO")
+
+
+# =============================================================================
+# 4d. ProgressDisplay Class (统一进度显示)
 # =============================================================================
 
 class ProgressDisplay:
@@ -1472,7 +1532,8 @@ def sync_single_pair(
     checkpoint_interval: int = 10,
     resume: bool = False,
     progress_manager: Optional[ProgressManager] = None,
-    pre_scanned_source_files: Optional[Dict[str, Path]] = None
+    pre_scanned_source_files: Optional[Dict[str, Path]] = None,
+    audit_logger: Optional['AuditLogger'] = None
 ) -> SyncResult:
     """同步单个源-目标对"""
     target.mkdir(parents=True, exist_ok=True)
@@ -1556,7 +1617,13 @@ def sync_single_pair(
             result.failed.append(rel_path)
             if verbose:
                 log_msg(f"{ANSIColors.STATUS_ERROR} 无法读取文件大小: {rel_path} ({e})")
+            if audit_logger:
+                audit_logger.log_file_error(rel_path, f"无法读取文件大小: {e}")
             continue
+
+        # 审计日志：记录文件开始
+        if audit_logger:
+            audit_logger.log_file_start(rel_path, source_size)
 
         if verbose and not show_progress:
             if shared_progress:
@@ -1571,6 +1638,8 @@ def sync_single_pair(
             if shared_progress:
                 shared_progress.start_file(rel_path, source_size, skipped=True)
                 shared_progress.complete_file(source_size)
+            if audit_logger:
+                audit_logger.log_file_skip(rel_path, "已存在")
             continue
 
         # Use shared progress manager if provided, otherwise create per-file (backward compat)
@@ -1606,6 +1675,8 @@ def sync_single_pair(
             result.failed.append(rel_path)
             if verbose:
                 log_msg(f"{ANSIColors.STATUS_ERROR} 拷贝失败: {rel_path} ({error})")
+            if audit_logger:
+                audit_logger.log_file_error(rel_path, str(error))
             # 保存失败前的进度
             if checkpoint_manager:
                 checkpoint_manager.save_checkpoint(rel_path, bytes_copied)
@@ -1644,6 +1715,10 @@ def sync_single_pair(
         result.files.append(file_result)
         result.total_bytes += bytes_copied
 
+        # 审计日志：记录文件完成
+        if audit_logger:
+            audit_logger.log_file_complete(rel_path, source_hash, copy_time)
+
         # 更新进度管理器(标记文件完成)
         if shared_progress:
             shared_progress.complete_file(source_size)
@@ -1664,6 +1739,18 @@ def sync_single_pair(
         shared_progress.finalize()
     elif show_progress and last_per_file_pm:
         last_per_file_pm.finalize()
+    
+    # 审计日志：写入汇总信息
+    if audit_logger:
+        elapsed_time = result.end_time - result.start_time
+        audit_logger.log_summary(
+            total_files=len(files_to_copy),
+            successful=len(result.copied),
+            skipped=len(result.skipped),
+            failed=len(result.failed),
+            total_bytes=result.total_bytes,
+            elapsed_time=elapsed_time
+        )
     
     return result
 
@@ -1874,6 +1961,10 @@ def run_copy(args, algorithm: str) -> int:
         )
         progress_manager = ProgressManager(files_to_copy_count, total_size, enabled=True)
 
+    # 创建审计日志（与 MHL 同目录的 .log 文件）
+    audit_log_filename = f".sync_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    audit_logger = AuditLogger(target / audit_log_filename, enabled=args.progress)
+
     if checkpoint_manager:
         _global_checkpoint = checkpoint_manager
         # 设置信号处理
@@ -1895,7 +1986,8 @@ def run_copy(args, algorithm: str) -> int:
         checkpoint_interval=args.checkpoint,
         resume=should_resume,
         progress_manager=progress_manager,
-        pre_scanned_source_files=pre_scanned_source_files
+        pre_scanned_source_files=pre_scanned_source_files,
+        audit_logger=audit_logger
     )
 
     result.project_name = args.project_name or target.name
