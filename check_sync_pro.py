@@ -449,6 +449,7 @@ class ProgressManager:
         self.enabled = enabled
         self.terminal_width = shutil.get_terminal_size((80, 20)).columns
         self._lock = threading.Lock()
+        self._first_render = True  # Track if this is the first render
         
     def start_file(self, filename: str, file_size: int):
         with self._lock:
@@ -496,14 +497,20 @@ class ProgressManager:
         
         name_display = self.current_file[:20].ljust(20)
         if self.terminal_width >= 100:
-            line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files) + " | " + format_size(self.completed_bytes) + "/" + format_size(self.total_bytes) + " | " + format_speed(self.completed_bytes, elapsed) + " | ETA: " + format_time(total_eta)
+            line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files) + " | " + format_size(self.completed_bytes) + "/" + format_size(self.total_bytes) + " | ETA: " + format_time(total_eta)
             line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display + " | " + format_size(self.current_file_copied) + "/" + format_size(self.current_file_size) + " | " + format_speed(self.current_file_copied, file_elapsed) + " | ETA: " + format_time(file_eta)
         else:
-            line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files) + " | " + format_speed(self.completed_bytes, elapsed)
+            line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files)
             line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display
         
         # Use ANSI cursor control: move up 2 lines, clear lines, print new content
-        output = chr(27) + "[2A" + chr(27) + "[K" + line1 + chr(10) + chr(27) + "[K" + line2 + chr(10)
+        if self._first_render:
+            # First render: just print, don't try to clear previous lines
+            output = line1 + chr(10) + chr(27) + "[K" + line2 + chr(10)
+            self._first_render = False
+        else:
+            # Subsequent renders: move up 2 lines and overwrite
+            output = chr(27) + "[2A" + chr(27) + "[K" + line1 + chr(10) + chr(27) + "[K" + line2 + chr(10)
         sys.stdout.write(output)
         sys.stdout.flush()
         
@@ -891,9 +898,7 @@ def sync_single_pair(
     """同步单个源-目标对"""
     target.mkdir(parents=True, exist_ok=True)
 
-    if verbose:
-        print(f"\n🔍 扫描源文件夹: {source}")
-    source_files = scan_folder(source, verbose)
+    source_files = scan_folder(source, verbose)  # scan_folder prints "🔍 扫描:" internally
     
     # 如果是恢复模式，从检查点获取需要跳过的已完成文件
     completed_files = set()
