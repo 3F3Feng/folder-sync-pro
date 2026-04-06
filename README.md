@@ -93,6 +93,14 @@ python3 check_sync_pro.py \
 | `source` | 源文件夹路径 | 必需 |
 | `target` | 目标文件夹路径 | 必需 |
 
+### 清理参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--clean-pollution` | 清理源盘 macOS 污染文件 | 否 |
+
+> **注意**：macOS 污染文件（.DS_Store、._*、.Trashes 等）默认会被忽略，不参与拷贝。使用 `--clean-pollution` 可在拷贝前删除这些文件。
+
 ### 校验参数
 
 | 参数 | 说明 | 默认值 |
