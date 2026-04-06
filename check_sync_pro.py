@@ -193,6 +193,8 @@ class SyncResult:
     algorithm: str = "md5"
     double_verify: bool = False
     project_name: str = ""  # 项目名称(MHL用)
+    aborted: bool = False  # 是否因预检失败而中止
+    abort_reason: str = ""  # 中止原因
 
 
 @dataclass
@@ -523,6 +525,60 @@ def check_source_readonly(source: Path) -> Tuple[bool, str]:
             pass
 
     return is_readonly, f"{status} {msg}"
+
+
+def check_disk_space(source_files: Dict[str, Path], target: Path, min_free_gb: float = 10.0) -> Tuple[bool, str]:
+    """
+    检查目标磁盘空间是否足够（拷贝前预检）
+    防止拷贝到 90% 时磁盘已满的片场大忌
+
+    Args:
+        source_files: 源文件字典 {相对路径: Path}
+        target: 目标目录
+        min_free_gb: 拷贝完成后最小剩余空间要求 (GB)
+
+    Returns:
+        (can_proceed, message)
+    """
+    import shutil
+
+    # 计算源文件总大小
+    total_source_size = sum(f.stat().st_size for f in source_files.values())
+    total_source_gb = total_source_size / (1024**3)
+
+    # 获取目标磁盘信息
+    try:
+        disk_usage = shutil.disk_usage(target)
+        free_gb = disk_usage.free / (1024**3)
+        total_gb = disk_usage.total / (1024**3)
+    except OSError as e:
+        return False, f"{ANSIColors.STATUS_ERROR} 无法读取目标磁盘信息: {e}"
+
+    # 计算需要的空间（考虑临时文件和哈希缓存，+5% buffer）
+    required_gb = total_source_gb * 1.05
+
+    # 检查空间是否足够
+    if free_gb < required_gb:
+        shortfall_gb = required_gb - free_gb
+        msg = (
+            f"{ANSIColors.STATUS_ERROR} 磁盘空间不足！\n"
+            f"  需要: {required_gb:.1f} GB (源数据 {total_source_gb:.1f} GB + 5% buffer)\n"
+            f"  可用: {free_gb:.1f} GB\n"
+            f"  缺口: {shortfall_gb:.1f} GB\n"
+            f"  目标磁盘总容量: {total_gb:.1f} GB"
+        )
+        return False, msg
+
+    # 检查最小剩余空间要求
+    remaining_after = free_gb - required_gb
+    if remaining_after < min_free_gb:
+        warning = (
+            f"{ANSIColors.STATUS_WARN} 警告: 拷贝后剩余空间仅 {remaining_after:.1f} GB\n"
+            f"  建议保留至少 {min_free_gb} GB 自由空间"
+        )
+        print(warning, file=sys.stderr)
+
+    return True, f"{ANSIColors.STATUS_OK} 磁盘检查通过 (需要 {required_gb:.1f} GB，可用 {free_gb:.1f} GB)"
 
 
 def scan_folder(folder: Path, verbose: bool = False) -> Dict[str, Path]:
@@ -1592,6 +1648,14 @@ def sync_single_pair(
     # 检查源盘写保护状态
     is_readonly, readonly_msg = check_source_readonly(source)
     print(readonly_msg, file=sys.stderr)
+
+    # 在开始拷贝前检查目标磁盘空间
+    can_proceed, space_msg = check_disk_space(source_files, target)
+    print(space_msg, file=sys.stderr)
+    if not can_proceed:
+        result.aborted = True
+        result.abort_reason = "磁盘空间不足"
+        return result
 
     stats = {'bytes': 0, 'time': 0}
 
