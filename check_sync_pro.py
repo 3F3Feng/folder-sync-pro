@@ -490,7 +490,7 @@ class ProgressManager:
         
         if self.terminal_width >= 100:
             line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files) + " | " + format_size(self.completed_bytes) + "/" + format_size(self.total_bytes) + " | " + format_speed(self.completed_bytes, elapsed) + " | ETA: " + format_time(total_eta)
-            line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + self.current_file[:25].ljust(25) + " | " + format_size(self.current_file_copied) + "/" + format_size(self.current_file_size) + " | ETA: " + format_time(file_eta)
+            line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + self.current_file[:20].ljust(20) + " | " + format_size(self.current_file_copied) + "/" + format_size(self.current_file_size) + " | " + format_speed(self.current_file_copied, file_elapsed) + " | ETA: " + format_time(file_eta)
         else:
             line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files) + " | " + format_speed(self.completed_bytes, elapsed)
             line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + self.current_file[:20].ljust(20)
