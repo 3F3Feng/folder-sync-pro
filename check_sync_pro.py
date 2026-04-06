@@ -73,7 +73,54 @@ except ImportError:
 # - WARNING, ERROR messages → stderr
 # - Progress bars (ANSI-controlled) → stdout
 # -----------------------------------------------------------------------------
-TERMINAL_WIDTH = shutil.get_terminal_size((80, 20)).columns
+
+
+def get_terminal_width() -> int:
+    """动态获取终端宽度,每次调用时重新计算以适应窗口 resize"""
+    return shutil.get_terminal_size((80, 20)).columns
+
+
+#向后兼容别名
+TERMINAL_WIDTH = get_terminal_width()
+
+
+class OutputManager:
+    """统一输出接口管理器 - 替代分散的 print() 语句"""
+    
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+    
+    def info(self, msg: str):
+        """INFO 级别消息 → stdout"""
+        print(msg, file=sys.stdout)
+    
+    def success(self, msg: str):
+        """SUCCESS 级别消息 → stdout"""
+        print(msg, file=sys.stdout)
+    
+    def warning(self, msg: str):
+        """WARNING 级别消息 → stderr"""
+        print(msg, file=sys.stderr)
+    
+    def error(self, msg: str):
+        """ERROR 级别消息 → stderr"""
+        print(msg, file=sys.stderr)
+    
+    def verbose_info(self, msg: str):
+        """VERBOSE INFO 级别消息 → stderr (only if verbose)"""
+        if self.verbose:
+            print(msg, file=sys.stderr)
+    
+    def progress_raw(self, msg: str):
+        """原始进度消息 → stdout (ANSI 控制，不换行)"""
+        sys.stdout.write(msg)
+        sys.stdout.flush()
+    
+    def progress_clear_line(self):
+        """清除当前行 → stdout"""
+        terminal_width = shutil.get_terminal_size((80, 20)).columns
+        sys.stdout.write(f"\r{' '.ljust(terminal_width)}\r")
+        sys.stdout.flush()
 
 
 class Mode(Enum):
@@ -326,8 +373,8 @@ def verify_file_hash(
     返回: (是否匹配, 实际哈希, 错误信息)
     """
     last_error = ""
-    # 获取终端宽度,预留1个字符用于清除行尾
-    terminal_width = TERMINAL_WIDTH - 1
+    # 获取终端宽度(动态),预留1个字符用于清除行尾
+    terminal_width = get_terminal_width() - 1
 
     for attempt in range(retries):
         bytes_read = 0
@@ -537,6 +584,8 @@ class ProgressManager:
         """
         if not self.enabled:
             return
+        # Dynamically get terminal width for each render (handles window resize)
+        terminal_width = shutil.get_terminal_size((80, 20)).columns
         # Use provided skipped value or fall back to instance variable
         effective_skipped = skipped if skipped is not None else self._skip_current_file
         if effective_skipped and not final:
@@ -580,7 +629,7 @@ class ProgressManager:
         # Show basename of file (last component of path) to avoid truncation
         import os
         name_display = os.path.basename(self.current_file)[:25].ljust(25)
-        if self.terminal_width >= 100:
+        if terminal_width >= 100:
             line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files) + " | " + format_size(self.completed_bytes) + "/" + format_size(self.total_bytes) + " | ETA: " + format_time(total_eta)
             line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display + " | " + format_size(self.current_file_copied) + "/" + format_size(self.current_file_size) + " | " + format_speed(self.current_file_copied, file_elapsed) + " | ETA: " + format_time(file_eta)
         else:
@@ -597,6 +646,26 @@ class ProgressManager:
             output = chr(27) + "[2A" + chr(27) + "[K" + line1 + chr(10) + chr(27) + "[K" + line2 + chr(10)
         sys.stdout.write(output)
         sys.stdout.flush()
+
+    def print_progress_line(self, current: int, total: int, current_file: str, stats: dict):
+        """Print single-line progress (mirrors legacy print_progress function)."""
+        pct = (current / total) * 100 if total > 0 else 0
+        bar_len = 30
+        filled = int(bar_len * current / total) if total > 0 else 0
+        bar = chr(9608) * filled + chr(9601) * (bar_len - filled)
+        display_name = current_file[:40] + "..." if len(current_file) > 40 else current_file
+        speed = format_speed(stats.get('bytes', 0), stats.get('time', 1))
+        
+        # Dynamically get terminal width
+        terminal_width = shutil.get_terminal_size((80, 20)).columns
+        progress_line = f"[{bar}] {pct:5.1f}% ({current}/{total}) | {speed} | {display_name}"
+        
+        sys.stdout.write(f"\r{progress_line.ljust(terminal_width)}")
+        sys.stdout.flush()
+        
+        if current >= total:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
     def _make_bar(self, pct: float, length: int) -> str:
         filled = int(length * pct / 100)
@@ -718,8 +787,291 @@ def format_speed(bytes_count: int, seconds: float) -> str:
     return f"{format_size(bytes_count / seconds)}/s"
 
 
+# =============================================================================
+# 4b. OutputManager Class (统一输出接口)
+# =============================================================================
+
+class OutputManager:
+    """
+    统一的命令行输出管理器
+    
+    输出类型:
+    - DEBUG (0)     → stdout (仅调试时)
+    - INFO (1)      → stdout
+    - WARNING (2)   → stderr
+    - ERROR (3)     → stderr
+    - SUCCESS (4)   → stdout
+    - PROGRESS (5)  → stdout (ANSI 进度条)
+    """
+    
+    DEBUG = 0
+    INFO = 1
+    WARNING = 2
+    ERROR = 3
+    SUCCESS = 4
+    PROGRESS = 5
+    
+    def __init__(self, debug: bool = False):
+        self.debug = debug
+        self._progress: Optional['ProgressDisplay'] = None
+    
+    def _get_terminal_width(self) -> int:
+        """获取当前终端宽度"""
+        return get_terminal_width()
+    
+    def _write(self, message: str, stream, flush: bool = True):
+        """写入指定流"""
+        stream.write(message)
+        if flush:
+            stream.flush()
+    
+    def debug(self, msg: str):
+        """调试信息"""
+        if self.debug:
+            self._write(f"[DEBUG] {msg}\n", sys.stdout)
+    
+    def info(self, msg: str):
+        """普通信息"""
+        self._write(f"{msg}\n", sys.stdout)
+    
+    def warn(self, msg: str):
+        """警告信息"""
+        self._write(f"⚠️ {msg}\n", sys.stderr)
+    
+    def error(self, msg: str):
+        """错误信息"""
+        self._write(f"❌ {msg}\n", sys.stderr)
+    
+    def success(self, msg: str):
+        """成功信息"""
+        self._write(f"✅ {msg}\n", sys.stdout)
+    
+    def progress_start(self, total_files: int, total_bytes: int):
+        """启动进度显示"""
+        self._progress = ProgressDisplay(total_files, total_bytes, enabled=True)
+        return self._progress
+    
+    def progress_update(self, filename: str, file_size: int, bytes_copied: int):
+        """更新进度"""
+        if self._progress:
+            if not self._progress.current_file or self._progress.current_file != filename:
+                self._progress.start_file(filename, file_size)
+            self._progress.update_file_progress(bytes_copied)
+    
+    def progress_complete(self, file_size: int):
+        """标记当前文件完成"""
+        if self._progress:
+            self._progress.complete_file(file_size)
+    
+    def progress_finish(self):
+        """结束进度显示"""
+        if self._progress:
+            self._progress.finalize()
+            self._progress = None
+    
+    # 兼容旧 print_progress 函数的功能
+    def print_progress(self, current: int, total: int, current_file: str, stats: dict):
+        """打印简单进度(单行)"""
+        pct = (current / total) * 100 if total > 0 else 0
+        bar_len = 30
+        filled = int(bar_len * current / total) if total > 0 else 0
+        bar = "█" * filled + "░" * (bar_len - filled)
+        display_name = current_file[:40] + "..." if len(current_file) > 40 else current_file
+        speed = format_speed(stats.get('bytes', 0), stats.get('time', 1))
+
+        progress_line = f"[{bar}] {pct:5.1f}% ({current}/{total}) | {speed} | {display_name}"
+
+        # 动态获取终端宽度
+        terminal_width = self._get_terminal_width()
+        # Pad with spaces to clear the line
+        self._write(f"\r{progress_line.ljust(terminal_width)}", sys.stdout)
+
+        if current >= total:
+            self._write("\n", sys.stdout)
+
+
+# =============================================================================
+# 4c. ProgressDisplay Class (统一进度显示)
+# =============================================================================
+
+class ProgressDisplay:
+    """
+    统一的进度显示管理器
+    
+    支持两种模式:
+    1. 双行模式(默认): 总进度 + 当前文件进度
+    2. 单行模式: 简单的单进度条
+    
+    这个类整合了原来的 ProgressManager 和 print_progress 的功能
+    """
+    
+    def __init__(self, total_files: int, total_bytes: int, enabled: bool = True, dual_line: bool = True):
+        self.total_files = total_files
+        self.total_bytes = total_bytes
+        self.completed_files = 0
+        self.completed_bytes = 0
+        self.current_file = ""
+        self.current_file_size = 0
+        self.current_file_copied = 0
+        self.start_time = time.time()
+        self.file_start_time = self.start_time
+        self.last_update = self.start_time
+        self.enabled = enabled
+        self.dual_line = dual_line  # True=双行, False=单行
+        self._lock = threading.Lock()
+        self._first_render = True
+        self._pending_file = False
+        self._skip_current_file = False
+        self._pending_skip_current_file = False
+        self._pending_completed_files = 0
+        self._pending_completed_bytes = 0
+    
+    def start_file(self, filename: str, file_size: int, skipped: bool = False):
+        """开始跟踪新文件"""
+        with self._lock:
+            if self._pending_file:
+                self.completed_files += self._pending_completed_files
+                self.completed_bytes += self._pending_completed_bytes
+                self._pending_completed_files = 0
+                self._pending_completed_bytes = 0
+                self._render_unlocked(final=True, skipped=self._pending_skip_current_file)
+                self._pending_file = False
+
+            self.current_file = filename
+            self.current_file_size = file_size
+            self.current_file_copied = 0
+            self.file_start_time = time.time()
+            self._skip_current_file = skipped
+            
+            if skipped:
+                self.current_file_copied = file_size
+                self._pending_file = True
+                self._pending_skip_current_file = True
+                self._pending_completed_files = 1
+                self._pending_completed_bytes = file_size
+            else:
+                self._pending_skip_current_file = False
+    
+    def update_file_progress(self, bytes_copied: int):
+        """更新当前文件进度"""
+        with self._lock:
+            self.current_file_copied = bytes_copied
+            self._skip_current_file = False
+            self._render_unlocked()
+    
+    def complete_file(self, file_size: int):
+        """标记文件完成"""
+        with self._lock:
+            if self._skip_current_file:
+                return
+            self._pending_completed_files = 1
+            self._pending_completed_bytes = file_size
+            self._pending_file = True
+            self._pending_skip_current_file = False
+    
+    def finalize(self):
+        """结束进度显示"""
+        with self._lock:
+            if self._pending_file:
+                self.completed_files += self._pending_completed_files
+                self.completed_bytes += self._pending_completed_bytes
+                self._pending_completed_files = 0
+                self._pending_completed_bytes = 0
+                self._render_unlocked(final=True, skipped=self._pending_skip_current_file)
+                self._pending_file = False
+
+    def _render_unlocked(self, final: bool = False, skipped: bool = None):
+        """内部渲染方法"""
+        if not self.enabled:
+            return
+        
+        # 动态获取终端宽度
+        terminal_width = self._get_terminal_width()
+        
+        effective_skipped = skipped if skipped is not None else self._skip_current_file
+        if effective_skipped and not final:
+            return
+
+        now = time.time()
+        if not final and now - self.last_update < 0.25 and self.current_file_copied < self.current_file_size:
+            return
+        self.last_update = now
+
+        if self._skip_current_file:
+            total_progress_bytes = self.completed_bytes
+            remaining_bytes = self.total_bytes - total_progress_bytes
+            total_pct = (total_progress_bytes / self.total_bytes * 100) if self.total_bytes > 0 else 100
+            file_pct = (self.current_file_copied / self.current_file_size * 100) if self.current_file_size > 0 else 100
+        else:
+            total_progress_bytes = self.completed_bytes + self.current_file_copied
+            remaining_bytes = self.total_bytes - total_progress_bytes
+            total_pct = (total_progress_bytes / self.total_bytes * 100) if self.total_bytes > 0 else 100
+            file_pct = (self.current_file_copied / self.current_file_size * 100) if self.current_file_size > 0 else 100
+
+        elapsed = now - self.start_time
+        avg_speed = total_progress_bytes / elapsed if elapsed > 0 else 0
+        total_eta = remaining_bytes / avg_speed if avg_speed > 0 else 0
+
+        file_elapsed = now - self.file_start_time
+        file_speed = self.current_file_copied / file_elapsed if file_elapsed > 0 else 0
+        remaining_file_bytes = self.current_file_size - self.current_file_copied
+        file_eta = remaining_file_bytes / file_speed if file_speed > 0 else 0
+
+        total_bar = self._make_bar(total_pct, 20)
+        file_bar = self._make_bar(file_pct, 20)
+
+        import os
+        name_display = os.path.basename(self.current_file)[:25].ljust(25)
+        
+        if self.dual_line:
+            # 双行模式
+            if terminal_width >= 100:
+                line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files) + " | " + format_size(self.completed_bytes) + "/" + format_size(self.total_bytes) + " | ETA: " + format_time(total_eta)
+                line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display + " | " + format_size(self.current_file_copied) + "/" + format_size(self.current_file_size) + " | " + format_speed(self.current_file_copied, file_elapsed) + " | ETA: " + format_time(file_eta)
+            else:
+                line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files)
+                line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display
+
+            if self._first_render:
+                output = line1 + chr(10) + chr(27) + "[K" + line2 + chr(10)
+                self._first_render = False
+            else:
+                output = chr(27) + "[2A" + chr(27) + "[K" + line1 + chr(10) + chr(27) + "[K" + line2 + chr(10)
+        else:
+            # 单行模式
+            display_name = name_display.strip()
+            speed_str = format_speed(self.current_file_copied, file_elapsed)
+            line = f"[{file_bar}] {file_pct:5.1f}% | {display_name} | {format_size(self.current_file_copied)}/{format_size(self.current_file_size)} | {speed_str}"
+            
+            if self._first_render:
+                output = line + chr(10)
+                self._first_render = False
+            else:
+                output = chr(27) + "[A" + chr(27) + "[K" + line + chr(10)
+        
+        sys.stdout.write(output)
+        sys.stdout.flush()
+    
+    def _get_terminal_width(self) -> int:
+        """获取当前终端宽度(每次重新计算)"""
+        return get_terminal_width()
+    
+    def _make_bar(self, pct: float, length: int) -> str:
+        filled = int(length * pct / 100)
+        return chr(9608) * filled + chr(9601) * (length - filled)
+
+
+# =============================================================================
+# 4d. Legacy Aliases (向后兼容)
+# =============================================================================
+
+# ProgressManager 作为 ProgressDisplay 的别名(向后兼容)
+ProgressManager = ProgressDisplay
+
+
+# 兼容旧的 print_progress 函数
 def print_progress(current: int, total: int, current_file: str, stats: dict):
-    """打印进度"""
+    """打印进度(兼容旧接口) - 动态获取终端宽度"""
     pct = (current / total) * 100 if total > 0 else 0
     bar_len = 30
     filled = int(bar_len * current / total) if total > 0 else 0
@@ -729,8 +1081,10 @@ def print_progress(current: int, total: int, current_file: str, stats: dict):
 
     progress_line = f"[{bar}] {pct:5.1f}% ({current}/{total}) | {speed} | {display_name}"
 
+    # 动态获取终端宽度
+    terminal_width = get_terminal_width()
     # Pad with spaces to clear the line
-    sys.stdout.write(f"\r{progress_line.ljust(TERMINAL_WIDTH)}")
+    sys.stdout.write(f"\r{progress_line.ljust(terminal_width)}")
     sys.stdout.flush()
 
     if current >= total:
@@ -1051,7 +1405,12 @@ def sync_single_pair(
             continue
 
         if verbose and not show_progress:
-            print_progress(idx, files_to_copy_count, rel_path, stats)
+            if shared_progress:
+                # Use ProgressManager's single-line progress method
+                shared_progress.print_progress_line(idx, files_to_copy_count, rel_path, stats)
+            else:
+                # Fallback to standalone function
+                print_progress(idx, files_to_copy_count, rel_path, stats)
 
         if target_path.exists() and skip_existing:
             result.skipped.append(rel_path)

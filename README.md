@@ -512,8 +512,26 @@ a1b2c3d4e5f67890
    - 添加全局常量 `TERMINAL_WIDTH`
    - 移除重复的 `shutil.get_terminal_size()` 调用
 
-5. **清理裸 print() 语句**
+5. **Terminal Width 动态更新**
+   - `ProgressManager._render_unlocked()` 每次 render 时重新获取终端宽度
+   - 用户调整终端窗口大小时自动自适应
+
+6. **清理裸 print() 语句**
    - 警告消息现在明确使用 `file=sys.stderr`
+
+**P2 - 合并进度显示:**
+
+7. **合并 print_progress() 到 ProgressManager**
+   - 添加 `print_progress_line()` 方法到 ProgressManager
+   - 统一单行进度显示逻辑
+   - 保留独立的 `print_progress()` 函数用于向后兼容
+
+**P3 - 统一输出接口:**
+
+8. **添加 OutputManager 类**
+   - 统一 stdout/stderr 输出接口
+   - 方法: `info()`, `success()`, `warning()`, `error()`, `verbose_info()`, `progress_raw()`, `progress_clear_line()`
+   - 为将来更细粒度的输出控制做准备
 
 ## 许可证 / License
 
