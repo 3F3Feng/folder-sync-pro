@@ -232,8 +232,3 @@ python3 check_sync_pro.py --resume /path/to/target/.sync-progress.json
 
 MIT License
 
----
-
-## 相关工具
-
-- `check_sync.py` - 文件夹一致性校验工具（仅对比，不拷贝）
