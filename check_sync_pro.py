@@ -1700,7 +1700,8 @@ def run_copy(args, algorithm: str) -> int:
         checkpoint_manager = CheckpointManager(source, target, interval=args.checkpoint)
 
     # 扫描一次源文件夹,避免在 sync_single_pair 中重复扫描
-    scan_result = scan_and_compare(source, target, args.verbose)
+    # Note: scan_and_compare's internal scan_folder calls will print, so don't pass verbose to avoid duplicate
+    scan_result = scan_and_compare(source, target, False)
     if args.verbose:
         print(f"🔍 扫描: {source}")
     pre_scanned_source_files = scan_result['source_files']
