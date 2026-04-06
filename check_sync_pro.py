@@ -1246,8 +1246,15 @@ def run_copy(args, algorithm: str) -> int:
     
     # 创建共享进度管理器（用于总进度追踪）
     if args.progress:
-        # Note: scan_folder is called again inside sync_single_pair, but that's needed for file list
-        source_files, files_to_copy_count, total_size, _ = scan_folder(source, False)
+        scan_result = scan_and_compare(source, target, False)
+        files_to_copy_count = len(scan_result['only_source']) + len(scan_result['common'])
+        total_size = sum(
+            scan_result['source_files'][f].stat().st_size 
+            for f in scan_result['only_source']
+        ) + sum(
+            scan_result['source_files'][f].stat().st_size 
+            for f in scan_result['common']
+        )
         progress_manager = ProgressManager(files_to_copy_count, total_size, enabled=True)
     
     if checkpoint_manager:
