@@ -466,7 +466,9 @@ def scan_folder(folder: Path, verbose: bool = False) -> Dict[str, Path]:
         print(f"🔍 扫描: {folder}", file=sys.stderr)
     for root, _, filenames in os.walk(folder):
         for filename in filenames:
-            if filename.endswith('.xxhash') or filename.endswith('.md5'):
+            # 哈希文件扩展名（大小写不敏感）
+            HASH_EXTENSIONS = {'.md5', '.xxhash', '.sha1', '.sha256', '.sha512'}
+            if any(filename.lower().endswith(ext) for ext in HASH_EXTENSIONS):
                 continue
             full_path = Path(root) / filename
             rel_path = str(full_path.relative_to(folder))
