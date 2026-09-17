@@ -1720,6 +1720,93 @@ class TestVersionSingleSourceOfTruth:
         assert sync_pro.__version__ in capsys.readouterr().out
 
 
+class TestVerifyConsoleSummary:
+    """--verify 跑完只剩一屏进度条,通过/失败的总数以前只进审计日志"""
+
+    def _tree(self):
+        base = Path(tempfile.mkdtemp())
+        src, dst = base / "src", base / "dst"
+        src.mkdir()
+        dst.mkdir()
+        (src / "IMG_0001.CR3").write_bytes(b"camera-data")
+        shutil.copy2(src / "IMG_0001.CR3", dst / "IMG_0001.CR3")
+        return base, src, dst
+
+    def _run_verify(self, monkeypatch, capsys, src, dst, *extra):
+        monkeypatch.setattr(sys, "argv",
+                            ["check_sync_pro.py", str(src), str(dst), "--verify", *extra])
+        with pytest.raises(SystemExit) as e:
+            sync_pro.main()
+        return e.value.code, capsys.readouterr().out
+
+    def test_summary_prints_without_verbose(self, monkeypatch, capsys):
+        base, src, dst = self._tree()
+        try:
+            code, out = self._run_verify(monkeypatch, capsys, src, dst)
+            assert code == 0
+            # 摘要不能再被 --verbose 挡住
+            assert "📊 校验完成" in out
+            assert "对比文件: 1 个文件" in out
+            assert "校验通过: 1 个文件" in out
+            assert "失败文件: 0 个文件" in out
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_summary_reports_failures(self, monkeypatch, capsys):
+        base, src, dst = self._tree()
+        try:
+            # 目标文件被改坏:摘要必须当场把失败数和文件名摆出来
+            (dst / "IMG_0001.CR3").write_bytes(b"corrupted!!")
+            code, out = self._run_verify(monkeypatch, capsys, src, dst)
+            assert code == 1
+            assert "校验通过: 0 个文件" in out
+            assert "失败文件: 1 个文件" in out
+            assert "失败文件列表" in out
+            assert "IMG_0001.CR3" in out
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_summary_reports_only_source_and_only_target(self, monkeypatch, capsys):
+        base, src, dst = self._tree()
+        try:
+            (src / "IMG_0002.CR3").write_bytes(b"only-in-source")
+            (dst / "IMG_0003.CR3").write_bytes(b"only-in-target")
+            code, out = self._run_verify(monkeypatch, capsys, src, dst)
+            assert code == 0
+            assert "对比文件: 1 个文件" in out
+            assert "仅存在于源文件夹: 1 个文件" in out
+            assert "仅存在于目标文件夹: 1 个文件" in out
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_summary_matches_copy_summary_style(self, monkeypatch, capsys):
+        """配色、分隔线和字段排布跟拷贝模式的摘要保持一致"""
+        base, src, dst = self._tree()
+        try:
+            _, out = self._run_verify(monkeypatch, capsys, src, dst)
+            assert "=" * 50 in out
+            assert f"{sync_pro.ANSIColors.STATUS_OK} 校验通过:" in out
+            assert f"{sync_pro.ANSIColors.STATUS_ERROR} 失败文件:" in out
+            # validate_paths 会 resolve(),macOS 上 /var -> /private/var
+            assert f"源文件夹: {src.resolve()}" in out
+            assert f"目标文件夹: {dst.resolve()}" in out
+            assert "哈希算法:" in out
+            assert "总数据量:" in out
+            assert "总耗时:" in out
+            assert "平均速度:" in out
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_only_source_line_omitted_when_trees_match(self, monkeypatch, capsys):
+        base, src, dst = self._tree()
+        try:
+            _, out = self._run_verify(monkeypatch, capsys, src, dst)
+            assert "仅存在于源文件夹" not in out
+            assert "仅存在于目标文件夹" not in out
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
 class TestDeadCodeRemoved:
     """被遮蔽的重复实现已经删掉,留下的必须是后定义的那一份"""
 

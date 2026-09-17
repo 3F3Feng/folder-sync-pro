@@ -1474,6 +1474,50 @@ def print_result_summary(result: SyncResult, verbose: bool = True, mode: Mode = 
             print(f" ... 还有 {len(result.failed) - 10} 个")
 
 
+def print_verify_summary(result: SyncResult, only_in_source: int = 0, only_in_target: int = 0):
+    """
+    打印校验模式的控制台摘要
+
+    校验模式以前只把总数写进审计日志,终端上跑完一屏进度条之后什么都不剩,
+    用户拿不到"到底过没过"的结论。这里刻意不受 --verbose 控制:交付现场
+    必须当场看到结果。格式、配色和中文措辞与拷贝模式的摘要保持一致。
+    """
+    # 每个被校验的文件只会落进 copied 或 failed 其中一个,
+    # 用两者之和统计比 len(result.files) 准确 —— 连文件大小都读不到的
+    # 那种失败不会往 result.files 里追加记录。
+    passed = len(result.copied)
+    failed = len(result.failed)
+    compared = passed + failed
+
+    print()
+    print("\n" + "=" * 50)
+    print("📊 校验完成")
+    print("=" * 50)
+    print(f"源文件夹: {result.source}")
+    print(f"目标文件夹: {result.target}")
+    print(f"哈希算法: {result.algorithm.upper()}")
+    print()
+    print(f"🔍 对比文件: {compared} 个文件")
+    print(f"{ANSIColors.STATUS_OK} 校验通过: {passed} 个文件")
+    print(f"{ANSIColors.STATUS_ERROR} 失败文件: {failed} 个文件")
+    if only_in_source:
+        print(f"{ANSIColors.STATUS_WARN} 仅存在于源文件夹: {only_in_source} 个文件")
+    if only_in_target:
+        print(f"{ANSIColors.STATUS_WARN} 仅存在于目标文件夹: {only_in_target} 个文件")
+    print()
+    print(f"📦 总数据量: {format_size(result.total_bytes)}")
+    duration = result.end_time - result.start_time
+    print(f"⏱️ 总耗时: {duration:.1f} 秒")
+    print(f"🚀 平均速度: {format_speed(result.total_bytes, duration)}")
+
+    if result.failed:
+        print("\n❌ 失败文件列表:")
+        for f in result.failed[:10]:
+            print(f" - {f}")
+        if len(result.failed) > 10:
+            print(f" ... 还有 {len(result.failed) - 10} 个")
+
+
 def save_json_report(report_data: dict, report_path: str, verbose: bool = False):
     """保存 JSON 报告"""
     try:
@@ -1921,13 +1965,9 @@ def run_verify(args, algorithm: str) -> int:
         elapsed_time=result.end_time - result.start_time
     )
 
-    # 打印结果
-    print_result_summary(result, args.verbose, Mode.VERIFY)
-
-    if only_in_source and args.verbose:
-        print(f"\n⚠️ 仅存在于源文件夹: {len(only_in_source)} 个文件")
-    if only_in_target and args.verbose:
-        print(f"{ANSIColors.STATUS_WARN} 仅存在于目标文件夹: {len(only_in_target)} 个文件")
+    # 打印结果。不加 --verbose 也要打:退出码和审计日志都对,
+    # 但用户在终端上得当场看见通过/失败的总数。
+    print_verify_summary(result, len(only_in_source), len(only_in_target))
 
     # 生成报告
     if args.report:
