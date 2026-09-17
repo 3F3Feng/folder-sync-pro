@@ -12,6 +12,7 @@ Tests the following features:
 - Sidecar file generation
 """
 
+import builtins
 import hashlib
 import json
 import os
@@ -928,6 +929,138 @@ class TestCopyAndHashFile:
         cm_reloaded = sync_pro.CheckpointManager(source, target, checkpoint_file)
         assert cm_reloaded.state["files"]["long_file.bin"]["size"] == len(test_data)
         assert cm_reloaded.state["files"]["long_file.bin"]["hash"] == hash_val
+
+
+class TestCopyIntegrityRegressions:
+    """Regression tests for silent data-loss bugs in _copy_and_hash_file"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        """Create temporary source and target directories"""
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_retry_after_midwrite_failure_yields_identical_target(self, temp_dirs, monkeypatch):
+        """BUG-1: a write failure mid-copy must not leave a truncated target with a bogus hash"""
+        source, target = temp_dirs
+        chunk_size = 1024
+        source_data = os.urandom(chunk_size * 10)
+        source_file = source / "clip.bin"
+        source_file.write_bytes(source_data)
+        target_file = target / "clip.bin"
+
+        real_open = builtins.open
+        opens = {"count": 0}
+
+        class FailingWriter:
+            """Wraps the target file handle and fails part-way through the copy"""
+
+            def __init__(self, fh, chunks_before_failure):
+                self._fh = fh
+                self._remaining = chunks_before_failure
+
+            def write(self, data):
+                if self._remaining <= 0:
+                    raise OSError(28, "No space left on device")
+                self._remaining -= 1
+                return self._fh.write(data)
+
+            def __getattr__(self, name):
+                return getattr(self._fh, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return self._fh.__exit__(*exc_info)
+
+        def fake_open(file, mode='r', *args, **kwargs):
+            fh = real_open(file, mode, *args, **kwargs)
+            if Path(str(file)) == target_file and any(c in mode for c in ('w', 'a', '+')):
+                opens["count"] += 1
+                if opens["count"] == 1:
+                    # 第一次尝试写入 3 个块后模拟磁盘写满
+                    return FailingWriter(fh, chunks_before_failure=3)
+            return fh
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        monkeypatch.setattr(sync_pro.time, "sleep", lambda *_: None)
+
+        hash_val, _, bytes_copied, error = sync_pro._copy_and_hash_file(
+            source_file, target_file, "md5", chunk_size=chunk_size, retries=3
+        )
+
+        monkeypatch.undo()
+
+        assert opens["count"] >= 2  # 确认确实发生了重试
+        assert error == ""
+        # 目标文件必须与源文件逐字节一致,而不是丢掉开头的部分
+        assert target_file.read_bytes() == source_data
+        # 返回的哈希必须真正对应源文件/目标文件的内容
+        assert hash_val == hashlib.md5(source_data).hexdigest()
+        assert bytes_copied == len(source_data)
+
+    def test_existing_same_size_different_content_is_recopied(self, temp_dirs):
+        """BUG-2: a same-size target with different content must be re-copied, not trusted"""
+        source, target = temp_dirs
+
+        source_data = b"A" * 4096
+        stale_data = b"B" * 4096
+        source_file = source / "clip.mov"
+        source_file.write_bytes(source_data)
+        target_file = target / "clip.mov"
+        target_file.write_bytes(stale_data)
+
+        hash_val, _, bytes_copied, error = sync_pro._copy_and_hash_file(
+            source_file, target_file, "md5", resume=True
+        )
+
+        assert error == ""
+        # 返回的必须是源文件的哈希,而不是目标文件自己的哈希
+        assert hash_val == hashlib.md5(source_data).hexdigest()
+        assert target_file.read_bytes() == source_data
+        assert bytes_copied == len(source_data)
+
+    def test_progress_checkpoint_does_not_enable_resume(self, temp_dirs):
+        """BUG-2: --progress (checkpoint manager) alone must not enable resume semantics"""
+        source, target = temp_dirs
+
+        source_data = b"A" * 2048
+        stale_data = b"B" * 2048
+        (source / "a.mov").write_bytes(source_data)
+        (target / "a.mov").write_bytes(stale_data)
+
+        cm = sync_pro.CheckpointManager(source, target, target / ".sync-progress.json")
+
+        result = sync_pro.sync_single_pair(
+            source=source,
+            target=target,
+            algorithm="md5",
+            double_verify=True,
+            skip_existing=False,
+            preserve_metadata=True,
+            preserve_xattr=False,
+            sidecar=False,
+            retries=3,
+            verbose=False,
+            checkpoint_manager=cm,
+            resume=False
+        )
+
+        assert "a.mov" in result.copied
+        assert (target / "a.mov").read_bytes() == source_data
+
+        file_result = next(f for f in result.files if f.relative_path == "a.mov")
+        # source_hash 必须来自源文件,否则报告里的校验等于目标文件和自己比较
+        assert file_result.source_hash == hashlib.md5(source_data).hexdigest()
+
+        report = sync_pro.generate_report(result)
+        entry = next(f for f in report["files"] if f["path"] == "a.mov")
+        assert entry["verified"] is True
+        assert entry["source_hash"] == hashlib.md5(source_data).hexdigest()
 
 
 class TestPathValidation:

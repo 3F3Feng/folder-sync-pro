@@ -310,17 +310,27 @@ def _copy_and_hash_file(
             except OSError as e:
                 return "", time.time() - start_time, 0, f"删除目标文件失败: {e}"
         elif current_target_size == source_size:
-            # File might be complete, verify hash
+            # 大小相同不代表内容相同,必须以源文件的哈希为准进行比对。
+            # 绝对不能只计算目标文件的哈希并当作源哈希返回,否则后续校验
+            # 等于拿目标文件和它自己比较,永远不会失败(静默数据丢失)。
             # 加上 \033[2K\r 可以清除当前进度条的干扰
             log_msg = log_callback if log_callback else (lambda m: print(m, file=sys.stderr))
             log_msg(f"{ANSIColors.STATUS_OK} {display_path} 已存在且大小匹配，正在校验...")
-            hash_val, _, _, err = compute_file_hash(target_path, algorithm)
-            if not err:
-                # If hash matches, we can skip. Here we return the hash as if we copied it.
-                return hash_val, 0.0, source_size, ""
+            source_hash_val, _, _, src_err = compute_file_hash(source_path, algorithm)
+            if src_err:
+                log_msg(f"{ANSIColors.STATUS_WARN} 读取源文件失败 ({src_err}), 正在重新复制...")
+                bytes_copied = 0
             else:
-                 log_msg(f"{ANSIColors.STATUS_WARN} 校验失败 ({err}), 正在重新复制...")
-                 bytes_copied = 0
+                target_hash_val, _, _, tgt_err = compute_file_hash(target_path, algorithm)
+                if not tgt_err and target_hash_val == source_hash_val:
+                    # 内容与源文件完全一致,可以安全跳过,返回的是源文件哈希
+                    return source_hash_val, 0.0, source_size, ""
+                elif tgt_err:
+                    log_msg(f"{ANSIColors.STATUS_WARN} 校验失败 ({tgt_err}), 正在重新复制...")
+                    bytes_copied = 0
+                else:
+                    log_msg(f"{ANSIColors.STATUS_WARN} 内容与源文件不一致, 正在重新复制...")
+                    bytes_copied = 0
         else: # current_target_size < source_size
             # Partial file exists, verify its integrity before resuming
             log_msg = log_callback if log_callback else (lambda m: print(m, file=sys.stderr))
@@ -354,12 +364,29 @@ def _copy_and_hash_file(
                 bytes_copied = 0
 
     # --- Copy Logic ---
-    open_mode = 'ab' if bytes_copied > 0 else 'wb'
+    # 续传基线:每次重试都必须回到这个状态。
+    # 否则上一次失败时累积的 bytes_copied 和哈希状态会被带到下一次尝试,
+    # 而目标文件却被重新截断打开,导致目标文件损坏但仍然返回"成功"。
+    resume_bytes = bytes_copied
+    resume_hash_func = hash_func
 
     for attempt in range(retries):
+        # 重置本次尝试的状态,保证哈希覆盖的字节流与实际写入目标的字节流一致
+        bytes_copied = resume_bytes
+        hash_func = resume_hash_func.copy()
+        if bytes_copied > 0 and not target_path.exists():
+            # 目标文件在两次尝试之间消失了,只能从头开始
+            bytes_copied = 0
+            hash_func = get_hash_func(algorithm)
+
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
+            # 续传用 r+b 打开,配合 truncate 清除上次失败时写入的残留数据;
+            # 从头复制用 wb,打开时即清空目标文件
+            open_mode = 'r+b' if bytes_copied > 0 else 'wb'
             with open(source_path, 'rb') as src, open(target_path, open_mode) as tgt:
+                tgt.truncate(bytes_copied)
+                tgt.seek(bytes_copied)
                 src.seek(bytes_copied)
 
                 while True:
@@ -1772,7 +1799,9 @@ def sync_single_pair(
             preserve_xattr=preserve_xattr,
             checkpoint_manager=checkpoint_manager,
             progress_callback=progress_callback,
-            resume=resume or bool(checkpoint_manager),
+            # 只有真正的续传模式(--resume)才启用续传语义。
+            # 仅仅因为 --progress 创建了 checkpoint_manager 就复用已存在的目标文件是不安全的
+            resume=resume,
             log_callback=log_cb
         )
 
