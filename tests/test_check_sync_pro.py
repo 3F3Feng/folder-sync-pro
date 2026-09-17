@@ -1063,6 +1063,291 @@ class TestCopyIntegrityRegressions:
         assert entry["source_hash"] == hashlib.md5(source_data).hexdigest()
 
 
+class TestUnicodeNormalizationKeying:
+    """BUG-3: NFD/NFC 文件名必须被当成同一个文件,否则校验模式会静默跳过"""
+
+    NFC_NAME = "café.mov"          # café,单个预组合字符
+    NFD_NAME = "café.mov"         # café,e + 组合音符
+
+    @pytest.fixture
+    def temp_dirs(self):
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_normalize_rel_key_unifies_nfc_and_nfd(self):
+        """规范化键必须把两种写法折叠成同一个字符串"""
+        assert self.NFC_NAME != self.NFD_NAME  # 前提: 它们确实是两个不同的字符串
+        assert sync_pro.normalize_rel_key(self.NFC_NAME) == sync_pro.normalize_rel_key(self.NFD_NAME)
+
+    def test_scan_and_compare_matches_nfd_against_nfc(self, temp_dirs, monkeypatch):
+        """源端 NFC、目标端 NFD 的同一个文件必须落在 common,而不是各自 only_*
+
+        这里用假的 os.walk,让测试不依赖运行测试的文件系统是否做规范化。
+        """
+        source, target = temp_dirs
+        walk_table = {
+            str(source): [(str(source), [], [self.NFC_NAME])],
+            str(target): [(str(target), [], [self.NFD_NAME])],
+        }
+
+        def fake_walk(folder):
+            return iter(walk_table[str(folder)])
+
+        monkeypatch.setattr(sync_pro.os, "walk", fake_walk)
+
+        comparison = sync_pro.scan_and_compare(source, target, verbose=False)
+
+        assert len(comparison['common']) == 1
+        assert comparison['only_source'] == set()
+        assert comparison['only_target'] == set()
+
+        # 字典里保存的必须是磁盘上的真实路径(而不是被规范化过的名字)
+        key = next(iter(comparison['common']))
+        assert comparison['source_files'][key].name == self.NFC_NAME
+        assert comparison['target_files'][key].name == self.NFD_NAME
+
+    def test_copy_uses_real_on_disk_name_not_normalized_key(self, temp_dirs, monkeypatch):
+        """拷贝时目标文件名必须沿用源文件磁盘上的真实写法"""
+        source, target = temp_dirs
+        real_name = self.NFD_NAME
+        source_file = source / real_name
+        try:
+            source_file.write_bytes(b"data")
+        except OSError:
+            pytest.skip("当前文件系统无法创建该文件名")
+        if real_name not in os.listdir(source):
+            pytest.skip("当前文件系统会自动规范化文件名,无法验证该行为")
+
+        result = sync_pro.sync_single_pair(
+            source=source, target=target, algorithm="md5",
+            double_verify=False, skip_existing=False,
+            preserve_metadata=False, preserve_xattr=False,
+            sidecar=False, retries=3, verbose=False
+        )
+
+        assert len(result.copied) == 1
+        assert real_name in os.listdir(target)
+
+
+class TestCaseCollisionDetection:
+    """BUG-4: 仅大小写不同的文件名在大小写不敏感的目标盘上会互相覆盖"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_detect_case_collisions_finds_pair(self):
+        files = {
+            "Clip.MOV": Path("/src/Clip.MOV"),
+            "clip.mov": Path("/src/clip.mov"),
+            "other.mov": Path("/src/other.mov"),
+        }
+        collisions = sync_pro.detect_case_collisions(files)
+        assert len(collisions) == 1
+        assert sorted(next(iter(collisions.values()))) == ["Clip.MOV", "clip.mov"]
+
+    def test_detect_case_collisions_empty_when_unique(self):
+        files = {"a.mov": Path("/src/a.mov"), "b.mov": Path("/src/b.mov")}
+        assert sync_pro.detect_case_collisions(files) == {}
+
+    def test_sync_aborts_on_case_insensitive_target(self, temp_dirs, monkeypatch, capsys):
+        """目标盘大小写不敏感时必须中止,而不是让两个文件互相静默覆盖"""
+        source, target = temp_dirs
+        (source / "Clip.MOV").write_bytes(b"AAAA")
+        # 只在字典里模拟出冲突,避免依赖测试文件系统能否同时创建这两个文件
+        pre_scanned = {
+            "Clip.MOV": source / "Clip.MOV",
+            "clip.mov": source / "clip.mov",
+        }
+
+        monkeypatch.setattr(sync_pro, "is_case_insensitive_fs", lambda _p: True)
+
+        result = sync_pro.sync_single_pair(
+            source=source, target=target, algorithm="md5",
+            double_verify=False, skip_existing=False,
+            preserve_metadata=False, preserve_xattr=False,
+            sidecar=False, retries=3, verbose=False,
+            pre_scanned_source_files=pre_scanned
+        )
+
+        assert result.aborted is True
+        assert result.abort_reason == "文件名大小写冲突"
+        assert result.copied == []
+        captured = capsys.readouterr()
+        assert "大小写" in captured.err
+
+    def test_sync_proceeds_on_case_sensitive_target(self, temp_dirs, monkeypatch, capsys):
+        """目标盘大小写敏感时两个文件合法共存,只警告不中止"""
+        source, target = temp_dirs
+        (source / "Clip.MOV").write_bytes(b"AAAA")
+        pre_scanned = {"Clip.MOV": source / "Clip.MOV"}
+
+        monkeypatch.setattr(sync_pro, "is_case_insensitive_fs", lambda _p: False)
+        monkeypatch.setattr(sync_pro, "detect_case_collisions",
+                            lambda _files: {"clip.mov": ["Clip.MOV", "clip.mov"]})
+
+        result = sync_pro.sync_single_pair(
+            source=source, target=target, algorithm="md5",
+            double_verify=False, skip_existing=False,
+            preserve_metadata=False, preserve_xattr=False,
+            sidecar=False, retries=3, verbose=False,
+            pre_scanned_source_files=pre_scanned
+        )
+
+        assert result.aborted is False
+        assert result.copied == ["Clip.MOV"]
+        assert "仅大小写不同" in capsys.readouterr().err
+
+
+class TestDiskSpacePrecheckRobustness:
+    """BUG-5: 扫描后源文件消失不能让整次拷贝直接崩掉"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_vanished_source_file_is_skipped(self, temp_dirs, capsys):
+        source, target = temp_dirs
+        present = source / "present.mov"
+        present.write_bytes(b"x" * 1024)
+        missing = source / "gone.mov"  # 从未创建 —— 模拟扫描后掉盘
+
+        can_proceed, msg = sync_pro.check_disk_space(
+            {"present.mov": present, "gone.mov": missing}, target
+        )
+
+        assert can_proceed is True
+        assert "无法读取大小" in capsys.readouterr().err
+
+    def test_all_files_vanished_still_returns(self, temp_dirs):
+        source, target = temp_dirs
+        can_proceed, msg = sync_pro.check_disk_space(
+            {"gone.mov": source / "gone.mov"}, target
+        )
+        assert can_proceed is True
+
+
+class TestInLoopSpeedStats:
+    """BUG-6: 循环内的速度统计用了还没赋值的 end_time,得到负数耗时"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_progress_stats_time_is_never_negative(self, temp_dirs, monkeypatch):
+        source, target = temp_dirs
+        for name in ("a.mov", "b.mov", "c.mov"):
+            (source / name).write_bytes(b"x" * 512)
+
+        seen = []
+
+        def fake_print_progress(current, total, current_file, stats):
+            seen.append(dict(stats))
+
+        monkeypatch.setattr(sync_pro, "print_progress", fake_print_progress)
+
+        sync_pro.sync_single_pair(
+            source=source, target=target, algorithm="md5",
+            double_verify=False, skip_existing=False,
+            preserve_metadata=False, preserve_xattr=False,
+            sidecar=False, retries=3, verbose=True
+        )
+
+        assert len(seen) == 3
+        assert all(s['time'] >= 0 for s in seen), seen
+        # 后面的调用必须看到真实的累计耗时
+        assert seen[-1]['time'] > 0
+
+
+class TestNumericArgValidation:
+    """输入校验: 0/负数以前会一路带到运行时"""
+
+    def _args(self, **overrides):
+        import argparse
+        values = {"parallel": 1, "retries": 3, "checkpoint": 10}
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_valid_defaults_pass(self):
+        sync_pro.validate_numeric_args(self._args())
+
+    @pytest.mark.parametrize("field,value", [
+        ("parallel", 0), ("parallel", -1), ("parallel", 999),
+        ("retries", 0), ("retries", -3), ("retries", 100),
+        ("checkpoint", 0), ("checkpoint", -10), ("checkpoint", 99999),
+    ])
+    def test_out_of_range_exits(self, field, value, capsys):
+        with pytest.raises(SystemExit) as e:
+            sync_pro.validate_numeric_args(self._args(**{field: value}))
+        assert e.value.code != 0
+        assert f"--{field}" in capsys.readouterr().err
+
+
+class TestMultiTargetValidation:
+    """输入校验: 多源模式以前完全没有校验 --targets"""
+
+    def test_missing_parent_rejected(self, capsys):
+        base = Path(tempfile.mkdtemp())
+        try:
+            bad = base / "no_such_dir" / "backup"
+            assert sync_pro.validate_target_dirs([bad]) is False
+            assert "上级目录不存在" in capsys.readouterr().err
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_target_is_file_rejected(self, capsys):
+        base = Path(tempfile.mkdtemp())
+        try:
+            not_a_dir = base / "file.txt"
+            not_a_dir.write_text("x")
+            assert sync_pro.validate_target_dirs([not_a_dir]) is False
+            assert "不是文件夹" in capsys.readouterr().err
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_existing_writable_target_accepted(self):
+        base = Path(tempfile.mkdtemp())
+        try:
+            assert sync_pro.validate_target_dirs([base]) is True
+            # 不存在但上级可写 —— 允许,拷贝时会自动创建
+            assert sync_pro.validate_target_dirs([base / "new_backup"]) is True
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_run_multi_source_rejects_bad_target(self, capsys):
+        import argparse
+        base = Path(tempfile.mkdtemp())
+        try:
+            source = base / "src"
+            source.mkdir()
+            args = argparse.Namespace(
+                sources=[str(source)],
+                targets=[str(base / "no_such_dir" / "backup")],
+                parallel=1, verbose=False, double_verify=False, skip_existing=False,
+                preserve_metadata=False, preserve_xattr=False, sidecar=False,
+                retries=3, project_name=None, mhl=False, report=None
+            )
+            assert sync_pro.run_multi_source(args, "md5") == 1
+            assert "上级目录不存在" in capsys.readouterr().err
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
 class TestPathValidation:
     """Test path validation logic"""
 

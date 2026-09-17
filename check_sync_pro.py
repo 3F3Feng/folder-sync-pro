@@ -37,6 +37,7 @@ import socket
 import sys
 import time
 import signal
+import tempfile
 import threading
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -94,6 +95,11 @@ try:
     HAS_XATTR = True
 except ImportError:
     HAS_XATTR = False
+
+# 数值型命令行参数的合法范围(上限只是防手滑,不是硬性能限制)
+MIN_PARALLEL, MAX_PARALLEL = 1, 32
+MIN_RETRIES, MAX_RETRIES = 1, 10
+MIN_CHECKPOINT, MAX_CHECKPOINT = 1, 3600
 
 # -----------------------------------------------------------------------------
 # Output Stream Configuration
@@ -569,8 +575,24 @@ def check_disk_space(source_files: Dict[str, Path], target: Path, min_free_gb: f
     """
     import shutil
 
-    # 计算源文件总大小
-    total_source_size = sum(f.stat().st_size for f in source_files.values())
+    # 计算源文件总大小。
+    # 扫描完成到这里之间源盘可能掉线、文件可能被删,必须逐个容错:
+    # 一个读不到的文件不应该抛出未捕获的 OSError 把整次拷贝直接掀掉,
+    # 只要跳过并明确报出来就行(真正的失败会在拷贝该文件时被记录)。
+    total_source_size = 0
+    unreadable: List[str] = []
+    for rel_path, f in source_files.items():
+        try:
+            total_source_size += f.stat().st_size
+        except OSError as e:
+            unreadable.append(f"{rel_path} ({e.strerror or e})")
+
+    if unreadable:
+        preview = ", ".join(unreadable[:5])
+        suffix = f" ...(共 {len(unreadable)} 个)" if len(unreadable) > 5 else ""
+        print(f"{ANSIColors.STATUS_WARN} {len(unreadable)} 个源文件无法读取大小,"
+              f"已从空间预估中跳过: {preview}{suffix}", file=sys.stderr)
+
     total_source_gb = total_source_size / (1024**3)
 
     # 获取目标磁盘信息
@@ -636,8 +658,60 @@ def clean_pollution_files(folder: Path, verbose: bool = False) -> int:
     
     return cleaned
 
+def normalize_rel_key(rel_path: str) -> str:
+    """把相对路径转换成用于比较/查找的键(Unicode NFC)
+
+    macOS 的 APFS/HFS+ 会把文件名存成 NFD,而相机、Windows 和多数其它系统
+    给出的是 NFC。同一个文件名因此会得到两个不同的 Python 字符串,
+    scan_and_compare 的集合运算会把它拆成"仅源存在"+"仅目标存在",
+    校验模式于是完全不校验它 —— 静默地给出"一切正常"的假象。
+
+    注意: 返回值只能用于比较和字典查找。真正的磁盘路径必须使用字典里
+    保存的 Path 对象,绝不能把规范化后的字符串写回文件系统操作。
+    """
+    return unicodedata.normalize("NFC", rel_path)
+
+
+def detect_case_collisions(files: Dict[str, Path]) -> Dict[str, List[str]]:
+    """找出在大小写不敏感的文件系统上会互相覆盖的文件名
+
+    Clip.MOV 和 clip.mov 在大小写敏感的源盘上是两个不同的文件,拷到
+    macOS 默认的 APFS 上却是同一个文件,后拷的会静默覆盖先拷的;
+    校验模式的集合运算也会因此误报。
+
+    这里只负责找出冲突组(不做大小写归一化,否则会破坏大小写敏感文件系统上
+    两个文件合法共存的情况),是否中止由调用方根据目标盘的实际情况决定。
+
+    返回: {折叠后的键: [实际的键, ...]},只包含发生冲突的组
+    """
+    groups: Dict[str, List[str]] = {}
+    for key in files:
+        groups.setdefault(key.casefold(), []).append(key)
+    return {folded: sorted(keys) for folded, keys in groups.items() if len(keys) > 1}
+
+
+def is_case_insensitive_fs(folder: Path) -> bool:
+    """探测目录所在的文件系统是否大小写不敏感(macOS 默认的 APFS 就是)
+
+    探测失败时一律按"大小写敏感"处理: 宁可只警告,也不要凭猜测中止
+    一次本来正常的拷贝。
+    """
+    try:
+        with tempfile.NamedTemporaryFile(prefix=".fsync_case_probe_", suffix="A",
+                                         dir=folder) as probe:
+            probe_path = Path(probe.name)
+            twin = probe_path.with_name(probe_path.name[:-1] + "a")
+            return twin.exists()
+    except (OSError, ValueError):
+        return False
+
+
 def scan_folder(folder: Path, verbose: bool = False) -> Dict[str, Path]:
-    """递归扫描文件夹，排除哈希文件和 macOS 污染文件"""
+    """递归扫描文件夹，排除哈希文件和 macOS 污染文件
+
+    返回 {规范化的相对路径键: 磁盘上的真实 Path}。
+    键经过 NFC 规范化,只用于比较/查找;值才是可以直接 open/copy 的真实路径。
+    """
     files = {}
     if verbose:
         print(f"🔍 扫描: {folder}", file=sys.stderr)
@@ -664,13 +738,26 @@ def scan_folder(folder: Path, verbose: bool = False) -> Dict[str, Path]:
                 continue
             full_path = Path(root) / filename
             rel_path = str(full_path.relative_to(folder))
-            files[rel_path] = full_path
+            key = normalize_rel_key(rel_path)
+            existing = files.get(key)
+            if existing is not None and existing != full_path:
+                # 同一目录下同时存在 NFC 和 NFD 两种写法的同名文件
+                # (只可能出现在不做规范化的文件系统上)。保留先扫到的那个,
+                # 但必须明确警告 —— 不能静默丢掉另一个。
+                print(f"{ANSIColors.STATUS_WARN} Unicode 规范化冲突: "
+                      f"{rel_path} 与 {existing.relative_to(folder)} 规范化后同名,"
+                      f"仅处理先扫描到的那个", file=sys.stderr)
+                continue
+            files[key] = full_path
     return files
 
 
 def scan_and_compare(source: Path, target: Path, verbose: bool = False) -> dict:
     """
     扫描并对比两个文件夹
+
+    集合运算基于 scan_folder 给出的 NFC 规范化键,所以源端 NFC、
+    目标端 NFD 的同一个文件名会被正确地判成"共同文件"。
 
     返回: {
         'common': set,       # 共同文件
@@ -1445,6 +1532,55 @@ def validate_paths(args) -> Tuple[Path, Path]:
     return source, target
 
 
+def validate_numeric_args(args) -> None:
+    """校验数值型参数的取值范围
+
+    argparse 的 type=int 只保证是整数,0 和负数一样能通过:
+    --parallel 0 会让 ThreadPoolExecutor 直接抛异常,--retries 0 会让
+    重试循环一次都不执行(拷贝必然"失败"却没有任何错误信息),
+    --checkpoint 0 或负数则让进度保存退化成每写一块就落一次盘。
+    """
+    checks = (
+        ("--parallel", args.parallel, MIN_PARALLEL, MAX_PARALLEL),
+        ("--retries", args.retries, MIN_RETRIES, MAX_RETRIES),
+        ("--checkpoint", args.checkpoint, MIN_CHECKPOINT, MAX_CHECKPOINT),
+    )
+    for name, value, low, high in checks:
+        if value < low or value > high:
+            print(f"{ANSIColors.STATUS_ERROR} 错误: {name} 必须在 {low}-{high} 之间 "
+                  f"(当前: {value})", file=sys.stderr)
+            sys.exit(1)
+
+
+def validate_target_dirs(targets: List[Path]) -> bool:
+    """提前校验多目标路径是否存在且可写
+
+    单源模式下 validate_paths 已经做了路径检查,多源模式却只校验了 --sources。
+    备份盘没挂上、或者挂成只读,以前要拷到一半才会暴露出来。
+    """
+    for target in targets:
+        if target.exists():
+            if not target.is_dir():
+                print(f"{ANSIColors.STATUS_ERROR} 错误: 目标路径不是文件夹: {target}",
+                      file=sys.stderr)
+                return False
+            if not os.access(target, os.W_OK):
+                print(f"{ANSIColors.STATUS_ERROR} 错误: 目标路径不可写: {target}",
+                      file=sys.stderr)
+                return False
+        else:
+            parent = target.parent
+            if not parent.exists():
+                print(f"{ANSIColors.STATUS_ERROR} 错误: 目标路径的上级目录不存在: {parent}",
+                      file=sys.stderr)
+                return False
+            if not os.access(parent, os.W_OK):
+                print(f"{ANSIColors.STATUS_ERROR} 错误: 无法在 {parent} 下创建目标目录"
+                      f"(上级目录不可写)", file=sys.stderr)
+                return False
+    return True
+
+
 def setup_algorithm(args) -> str:
     """设置哈希算法"""
     algorithm = args.hash
@@ -1725,6 +1861,24 @@ def sync_single_pair(
         result.abort_reason = "磁盘空间不足"
         return result
 
+    # 检查仅大小写不同的文件名。在大小写不敏感的目标盘上它们其实是同一个文件,
+    # 继续拷贝就是让它们互相静默覆盖 —— 宁可中止,也不能交出一份缺文件的备份。
+    case_collisions = detect_case_collisions(source_files)
+    if case_collisions:
+        for keys in sorted(case_collisions.values()):
+            print(f"{ANSIColors.STATUS_WARN} 文件名仅大小写不同: {', '.join(keys)}",
+                  file=sys.stderr)
+        if is_case_insensitive_fs(target):
+            print(f"{ANSIColors.STATUS_ERROR} 目标盘大小写不敏感,上述 "
+                  f"{len(case_collisions)} 组文件会被拷成同一个文件并互相覆盖,已中止。\n"
+                  f"  请先重命名源文件,或改用大小写敏感的目标盘", file=sys.stderr)
+            result.aborted = True
+            result.abort_reason = "文件名大小写冲突"
+            result.end_time = time.time()
+            return result
+        print(f"{ANSIColors.STATUS_WARN} 目标盘大小写敏感,以上文件将分别拷贝",
+              file=sys.stderr)
+
     stats = {'bytes': 0, 'time': 0}
 
     # Use shared progress_manager if provided, otherwise create per-file as fallback
@@ -1741,7 +1895,13 @@ def sync_single_pair(
             print(msg, file=sys.stderr)
 
     for idx, (rel_path, source_path) in enumerate(files_to_copy, 1):
-        target_path = target / rel_path
+        # rel_path 是规范化后的比较键,可能和磁盘上的真实文件名不是同一个字符串
+        # (NFC vs NFD)。目标路径必须按源文件在磁盘上的真实相对路径构造,
+        # 否则在不做规范化的文件系统上会写出一个名字不一样的文件。
+        try:
+            target_path = target / source_path.relative_to(source)
+        except ValueError:
+            target_path = target / rel_path
 
         try:
             source_size = source_path.stat().st_size
@@ -1864,7 +2024,10 @@ def sync_single_pair(
             checkpoint_manager.mark_complete(rel_path, bytes_copied, source_hash)
 
         stats['bytes'] = result.total_bytes
-        stats['time'] = result.end_time - result.start_time
+        # result.end_time 此刻还是 0.0(要到循环结束后才赋值),
+        # 用它算差值会得到一个巨大的负数,单行进度条的速度读数因此完全错误。
+        # 这里要的是"到目前为止已经花掉的时间"。
+        stats['time'] = time.time() - result.start_time
 
     result.end_time = time.time()
     
@@ -1972,6 +2135,12 @@ def run_verify(args, algorithm: str) -> int:
     common_files = comparison['common']
     only_in_source = comparison['only_source']
     only_in_target = comparison['only_target']
+
+    # 仅大小写不同的文件名在大小写不敏感的盘上其实是同一个文件,
+    # 集合运算会给出错误的结论,必须明确提示而不是让用户以为校验全过了。
+    for keys in sorted(detect_case_collisions(comparison['source_files']).values()):
+        print(f"{ANSIColors.STATUS_WARN} 源文件名仅大小写不同,校验结果可能不准确: "
+              f"{', '.join(keys)}", file=sys.stderr)
 
     if args.verbose:
         print(f"\n📊 文件统计:")
@@ -2160,6 +2329,10 @@ def run_multi_source(args, algorithm: str) -> int:
         if not source.is_dir():
             print(f"{ANSIColors.STATUS_ERROR} 错误: 源路径不是文件夹: {source}", file=sys.stderr)
             return 1
+
+    # 验证目标路径(存在性与可写性),避免跑到一半才发现备份盘没挂上
+    if not validate_target_dirs(targets):
+        return 1
 
     source_target_pairs = [(s, t) for s in sources for t in targets]
     total_pairs = len(source_target_pairs)
@@ -2361,13 +2534,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--targets", nargs='+', metavar="PATH",
                         help="多个目标文件夹路径(多源拷贝模式)")
     parser.add_argument("--parallel", type=int, default=1, metavar="N",
-                        help="并发拷贝数(多源拷贝模式,默认: 1)")
+                        help=f"并发拷贝数(多源拷贝模式,{MIN_PARALLEL}-{MAX_PARALLEL},默认: 1)")
 
     # 校验参数
     parser.add_argument("--double-verify", action="store_true",
                         help="二次校验模式:拷贝后再读一遍目标文件验证")
     parser.add_argument("--retries", type=int, default=3,
-                        help="IO 错误重试次数 (默认: 3)")
+                        help=f"IO 错误重试次数 ({MIN_RETRIES}-{MAX_RETRIES},默认: 3)")
 
     # 输出参数
     parser.add_argument("--report", metavar="FILE", help="生成详细 JSON 报告")
@@ -2409,7 +2582,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", metavar="FILE",
                         help="从进度文件恢复拷贝(.sync-progress.json)")
     parser.add_argument("--checkpoint", type=int, default=10, metavar="N",
-                        help="每 N 秒保存进度(默认: 10)")
+                        help=f"每 N 秒保存进度({MIN_CHECKPOINT}-{MAX_CHECKPOINT},默认: 10)")
 
     return parser.parse_args()
 
@@ -2417,6 +2590,9 @@ def parse_args() -> argparse.Namespace:
 def main():
     """主函数 - 入口点"""
     args = parse_args()
+
+    # 校验数值参数范围(0/负数以前会一路带到运行时才炸)
+    validate_numeric_args(args)
 
     # 检查多源模式参数
     if args.sources or args.targets:
