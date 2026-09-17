@@ -1188,16 +1188,21 @@ class ProgressDisplay:
             return
         self.last_update = now
 
-        if self._skip_current_file:
+        # final=True 只有两个调用点(start_file 的挂起刷新和 finalize),它们都是先把
+        # _pending_completed_bytes 加进 completed_bytes、再渲染,而此刻 current_file_copied
+        # 仍然停留在刚完成的那个文件上 —— 再加一次就是把同一批字节数了两遍,总进度会
+        # 冲过 100%(50MB + 20MB 的两文件拷贝上实测 142.9% 和 128.6%)。
+        # 跳过的文件同理: start_file(skipped=True) 把 file_size 同时写进了
+        # current_file_copied 和挂起的 completed_bytes。
+        # 这两种情况下 completed_bytes 本身就是完整的总进度,不能再叠加当前文件。
+        if final or self._skip_current_file:
             total_progress_bytes = self.completed_bytes
-            remaining_bytes = self.total_bytes - total_progress_bytes
-            total_pct = (total_progress_bytes / self.total_bytes * 100) if self.total_bytes > 0 else 100
-            file_pct = (self.current_file_copied / self.current_file_size * 100) if self.current_file_size > 0 else 100
         else:
             total_progress_bytes = self.completed_bytes + self.current_file_copied
-            remaining_bytes = self.total_bytes - total_progress_bytes
-            total_pct = (total_progress_bytes / self.total_bytes * 100) if self.total_bytes > 0 else 100
-            file_pct = (self.current_file_copied / self.current_file_size * 100) if self.current_file_size > 0 else 100
+
+        remaining_bytes = self.total_bytes - total_progress_bytes
+        total_pct = (total_progress_bytes / self.total_bytes * 100) if self.total_bytes > 0 else 100
+        file_pct = (self.current_file_copied / self.current_file_size * 100) if self.current_file_size > 0 else 100
 
         elapsed = now - self.start_time
         avg_speed = total_progress_bytes / elapsed if elapsed > 0 else 0

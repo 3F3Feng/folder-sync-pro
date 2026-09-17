@@ -16,6 +16,7 @@ import builtins
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -606,6 +607,127 @@ class TestProgressManager:
         # Test hours format
         result = sync_pro.format_time(3661)
         assert "01:01:01" in result
+
+
+class TestProgressPercentageNeverExceeds100:
+    """
+    渲染出来的百分比不能冲过 100%
+
+    以前 _render_unlocked 在 final=True 的刷新路径上会把同一批字节数两遍:
+    start_file 的挂起刷新和 finalize 都是先把 _pending_completed_bytes 加进
+    completed_bytes 再渲染,而此刻 current_file_copied 还停在刚完成的那个文件上,
+    于是 total_progress_bytes = completed_bytes + current_file_copied 里有一份重复。
+    50MB + 20MB 的两文件拷贝上实测渲染出 142.9% 和 128.6%,单文件拷贝直接 200.0%。
+    """
+
+    ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+    PCT_RE = re.compile(r"([0-9]+\.[0-9])%")
+
+    def _rendered_pcts(self, capsys):
+        """把捕获到的进度输出里所有百分比取出来"""
+        out = self.ANSI_RE.sub("", capsys.readouterr().out)
+        return [float(v) for v in self.PCT_RE.findall(out)]
+
+    def _make(self, total_files, total_bytes):
+        # enabled=True 才会真正渲染;单行模式省掉光标上移,输出更好解析
+        return sync_pro.ProgressDisplay(
+            total_files=total_files, total_bytes=total_bytes,
+            enabled=True, dual_line=True,
+        )
+
+    def _copy_file(self, pm, name, size, chunks=4):
+        """模拟一个文件被完整拷完"""
+        pm.start_file(name, size)
+        for i in range(1, chunks + 1):
+            pm.update_file_progress(size * i // chunks)
+        pm.complete_file(size)
+
+    def test_single_file_stays_within_bounds(self, capsys):
+        # 修复前这里 finalize 会渲染出 200.0%
+        pm = self._make(1, 1000)
+        self._copy_file(pm, "only.bin", 1000)
+        pm.finalize()
+        pcts = self._rendered_pcts(capsys)
+        assert pcts, "should have rendered at least one progress line"
+        assert max(pcts) <= 100.0, f"rendered percentage over 100: {max(pcts)}"
+
+    def test_two_files_stays_within_bounds(self, capsys):
+        # 5:2 的大小比例正是复现出 142.9% / 128.6% 的那一组
+        pm = self._make(2, 70)
+        self._copy_file(pm, "a_big.bin", 50)
+        self._copy_file(pm, "b_small.bin", 20)
+        pm.finalize()
+        pcts = self._rendered_pcts(capsys)
+        assert pcts
+        assert max(pcts) <= 100.0, f"rendered percentage over 100: {max(pcts)}"
+
+    def test_many_small_files_stay_within_bounds(self, capsys):
+        sizes = [7 * i + 3 for i in range(1, 41)]
+        pm = self._make(len(sizes), sum(sizes))
+        for i, size in enumerate(sizes):
+            self._copy_file(pm, f"f{i}.bin", size, chunks=2)
+        pm.finalize()
+        pcts = self._rendered_pcts(capsys)
+        assert pcts
+        assert max(pcts) <= 100.0, f"rendered percentage over 100: {max(pcts)}"
+
+    def test_skipped_files_stay_within_bounds(self, capsys):
+        # --skip-existing 路径: start_file(skipped=True) 把 file_size 同时写进
+        # current_file_copied 和挂起的 completed_bytes
+        sizes = [120, 340, 55, 900]
+        pm = self._make(len(sizes), sum(sizes))
+        for i, size in enumerate(sizes):
+            pm.start_file(f"skip{i}.bin", size, skipped=True)
+            pm.complete_file(size)
+        pm.finalize()
+        pcts = self._rendered_pcts(capsys)
+        assert pcts
+        assert max(pcts) <= 100.0, f"rendered percentage over 100: {max(pcts)}"
+
+    def test_mixed_skip_and_copy_stays_within_bounds(self, capsys):
+        # 跳过和真拷交替,覆盖 _skip_current_file 在两次刷新之间翻转的情况
+        plan = [("a", 100, True), ("b", 250, False), ("c", 80, True), ("d", 70, False)]
+        pm = self._make(len(plan), sum(p[1] for p in plan))
+        for name, size, skipped in plan:
+            if skipped:
+                pm.start_file(name, size, skipped=True)
+                pm.complete_file(size)
+            else:
+                self._copy_file(pm, name, size, chunks=3)
+        pm.finalize()
+        pcts = self._rendered_pcts(capsys)
+        assert pcts
+        assert max(pcts) <= 100.0, f"rendered percentage over 100: {max(pcts)}"
+
+    def test_final_flush_does_not_double_count_completed_bytes(self, capsys):
+        """直接盯住根因: 刷新完成文件时总进度只能是 completed_bytes"""
+        pm = self._make(2, 70)
+        self._copy_file(pm, "a_big.bin", 50)
+        capsys.readouterr()  # 丢掉拷贝过程中的渲染,只看下面这次刷新
+        # 挂起的 50 字节在这里被 flush 进 completed_bytes 并渲染一次
+        pm.start_file("b_small.bin", 20)
+        assert pm.completed_bytes == 50
+        pcts = self._rendered_pcts(capsys)
+        assert pcts, "pending completion should have rendered a final line"
+        # 50/70 = 71.4%,修复前是 (50+50)/70 = 142.9%
+        assert pcts[0] == pytest.approx(71.4, abs=0.1)
+
+    def test_total_percentage_is_monotonic_and_ends_at_100(self, capsys):
+        """总进度不该回退,而且跑完必须正好到 100%"""
+        sizes = [50, 20, 30]
+        pm = self._make(len(sizes), sum(sizes))
+        for i, size in enumerate(sizes):
+            self._copy_file(pm, f"f{i}.bin", size, chunks=2)
+        pm.finalize()
+        out = self.ANSI_RE.sub("", capsys.readouterr().out)
+        totals = [
+            float(m) for m in
+            re.findall(r"总进度:.*?([0-9]+\.[0-9])%", out)
+        ]
+        assert totals, "should have rendered 总进度 lines"
+        assert totals == sorted(totals), f"total progress went backwards: {totals}"
+        assert max(totals) <= 100.0
+        assert totals[-1] == pytest.approx(100.0, abs=0.1)
 
 
 class TestCheckpointManager:
