@@ -80,6 +80,10 @@ class ANSIColors:
 # 3. Constants & Enums
 # =============================================================================
 
+# 版本号的唯一来源。MHL creatorinfo、JSON 报告和 --version 都从这里取;
+# 以前三处各自硬编码 "1.0.0",和 README 的更新日志早就对不上了。
+__version__ = "1.1.0"
+
 # 尝试导入 xxhash,失败则回退到 hashlib
 try:
     import xxhash
@@ -95,6 +99,11 @@ try:
     HAS_XATTR = True
 except ImportError:
     HAS_XATTR = False
+
+# 本工具写进目标文件夹的产物文件名。scan_folder 要按这些规则把它们排除掉,
+# 否则下一次 --verify 会把它们报成"仅存在于目标文件夹"。
+CHECKPOINT_FILENAME = ".sync-progress.json"
+AUDIT_LOG_PREFIX = ".sync_audit_"
 
 # 数值型命令行参数的合法范围(上限只是防手滑,不是硬性能限制)
 MIN_PARALLEL, MAX_PARALLEL = 1, 32
@@ -112,49 +121,6 @@ MIN_CHECKPOINT, MAX_CHECKPOINT = 1, 3600
 def get_terminal_width() -> int:
     """动态获取终端宽度,每次调用时重新计算以适应窗口 resize"""
     return shutil.get_terminal_size((80, 20)).columns
-
-
-#向后兼容别名
-TERMINAL_WIDTH = get_terminal_width()
-
-
-class OutputManager:
-    """统一输出接口管理器 - 替代分散的 print() 语句"""
-    
-    def __init__(self, verbose: bool = False):
-        self.verbose = verbose
-    
-    def info(self, msg: str):
-        """INFO 级别消息 → stdout"""
-        print(msg, file=sys.stdout)
-    
-    def success(self, msg: str):
-        """SUCCESS 级别消息 → stdout"""
-        print(msg, file=sys.stdout)
-    
-    def warning(self, msg: str):
-        """WARNING 级别消息 → stderr"""
-        print(msg, file=sys.stderr)
-    
-    def error(self, msg: str):
-        """ERROR 级别消息 → stderr"""
-        print(msg, file=sys.stderr)
-    
-    def verbose_info(self, msg: str):
-        """VERBOSE INFO 级别消息 → stderr (only if verbose)"""
-        if self.verbose:
-            print(msg, file=sys.stderr)
-    
-    def progress_raw(self, msg: str):
-        """原始进度消息 → stdout (ANSI 控制，不换行)"""
-        sys.stdout.write(msg)
-        sys.stdout.flush()
-    
-    def progress_clear_line(self):
-        """清除当前行 → stdout"""
-        terminal_width = shutil.get_terminal_size((80, 20)).columns
-        sys.stdout.write(f"\r{' '.ljust(terminal_width)}\r")
-        sys.stdout.flush()
 
 
 class Mode(Enum):
@@ -213,12 +179,6 @@ class MultiSourceResult:
     end_time: float = 0.0
 
 
-# 临时前向声明,避免循环依赖
-ProgressManager = None
-CheckpointManager = None
-SleepDetector = None
-
-
 def get_hash_func(algorithm: str):
     """获取哈希函数"""
     if algorithm == "xxhash" and HAS_XXHASH:
@@ -266,7 +226,7 @@ def compute_file_hash(
 
 
 # =============================================================================
-# 4a. Classes (ProgressManager, CheckpointManager, SleepDetector)
+# 4a. Classes (CheckpointManager, SleepDetector)
 # =============================================================================
 
 # NOTE: The following functions will reference these classes, so they are defined first.
@@ -706,8 +666,23 @@ def is_case_insensitive_fs(folder: Path) -> bool:
         return False
 
 
+def is_tool_artifact(filename: str) -> bool:
+    """判断文件是不是本工具自己写进目标文件夹的产物
+
+    .sync-progress.json(断点文件)、.sync_audit_*.log(审计日志)和 .mhl
+    报告都只存在于目标端,源盘上没有。不排除的话,下一次 --verify 会把它们
+    全部报成"仅存在于目标文件夹",看上去像是目标盘多出了来路不明的文件。
+    """
+    lower = filename.lower()
+    if filename == CHECKPOINT_FILENAME:
+        return True
+    if filename.startswith(AUDIT_LOG_PREFIX) and lower.endswith(".log"):
+        return True
+    return lower.endswith(".mhl")
+
+
 def scan_folder(folder: Path, verbose: bool = False) -> Dict[str, Path]:
-    """递归扫描文件夹，排除哈希文件和 macOS 污染文件
+    """递归扫描文件夹，排除哈希文件、macOS 污染文件和本工具自己的产物
 
     返回 {规范化的相对路径键: 磁盘上的真实 Path}。
     键经过 NFC 规范化,只用于比较/查找;值才是可以直接 open/copy 的真实路径。
@@ -735,6 +710,10 @@ def scan_folder(folder: Path, verbose: bool = False) -> Dict[str, Path]:
             
             # macOS 污染文件过滤
             if filename in POLLUTING_FILES or filename.startswith('._'):
+                continue
+
+            # 本工具自己写进目标文件夹的产物,不参与比较
+            if is_tool_artifact(filename):
                 continue
             full_path = Path(root) / filename
             rel_path = str(full_path.relative_to(folder))
@@ -790,220 +769,13 @@ def format_time(seconds: float) -> str:
         return time.strftime("%M:%S", time.gmtime(seconds))
 
 
-class ProgressManager:
-    """双行进度显示管理器(总进度 + 当前文件进度)"""
-
-    def __init__(self, total_files: int, total_bytes: int, enabled: bool = True):
-        self.total_files = total_files
-        self.total_bytes = total_bytes
-        self.completed_files = 0
-        self.completed_bytes = 0
-        self.current_file = ""
-        self.current_file_size = 0
-        self.current_file_copied = 0
-        self.start_time = time.time()
-        self.file_start_time = self.start_time
-        self.last_update = self.start_time
-        self.enabled = enabled
-        self.terminal_width = TERMINAL_WIDTH
-        self._lock = threading.Lock()
-        self._first_render = True  # Track if this is the first render
-        self._pending_file = False  # Track if we have a file waiting to be rendered
-        self._skip_current_file = False  # Track if current file should be skipped (for flicker prevention)
-        self._pending_skip_current_file = False  # Track if pending file was skipped
-        self._pending_completed_files = 0  # Track files to be marked complete when next file starts
-        self._pending_completed_bytes = 0
-        
-    def start_file(self, filename: str, file_size: int, skipped: bool = False):
-        """Start tracking a new file. Use skipped=True to mark file as already complete (no render)."""
-        with self._lock:
-            # If there was a previous file that just completed, apply its completion counters
-            if self._pending_file:
-                self.completed_files += self._pending_completed_files
-                self.completed_bytes += self._pending_completed_bytes
-                self._pending_completed_files = 0
-                self._pending_completed_bytes = 0
-                # Only render if the previous file was NOT skipped (had actual progress)
-                # or if this is not the first file we ever started
-                if not self._pending_skip_current_file or not self._first_render:
-                    self._render_unlocked(final=True)
-                self._pending_file = False
-
-            self.current_file = filename
-            self.current_file_size = file_size
-            self.current_file_copied = 0
-            self.file_start_time = time.time()
-            self._skip_current_file = skipped
-            
-            if skipped:
-                # For skipped files, mark as complete but DON'T render yet
-                # Defer rendering to when the next file starts to avoid flicker
-                self.current_file_copied = file_size
-                self._pending_file = True
-                self._pending_skip_current_file = True
-                self._pending_completed_files = 1
-                self._pending_completed_bytes = file_size
-            else:
-                self._pending_skip_current_file = False
-            # Don't render here - wait for update_file_progress or next file
-        
-    def update_file_progress(self, bytes_copied: int):
-        with self._lock:
-            self.current_file_copied = bytes_copied
-            self._skip_current_file = False
-            self._render_unlocked()
-        
-    def complete_file(self, file_size: int):
-        with self._lock:
-            # If file was skipped (already rendered), don't set pending flags
-            if self._skip_current_file:
-                return
-            # Mark as pending - will be applied when next file starts
-            self._pending_completed_files = 1
-            self._pending_completed_bytes = file_size
-            self._pending_file = True  # Flag that there's a pending completion
-            self._pending_skip_current_file = False  # This was a real copy, not skipped
-            # Don't render here - let the next start_file or update_file_progress trigger render
-            # This prevents showing progress for a file that's already complete
-    
-    def finalize(self):
-        """Finalize progress display - render any pending file."""
-        with self._lock:
-            if self._pending_file:
-                # Apply the pending completion counters before rendering
-                self.completed_files += self._pending_completed_files
-                self.completed_bytes += self._pending_completed_bytes
-                self._pending_completed_files = 0
-                self._pending_completed_bytes = 0
-                # Pass the pending skip flag to render
-                self._render_unlocked(final=True, skipped=self._pending_skip_current_file)
-                self._pending_file = False
-
-    def _render_unlocked(self, final: bool = False, skipped: bool = None):
-        """Internal render without lock - caller must hold lock. final=True forces render of completed state.
-        
-        Args:
-            final: If True, always render even if throttled
-            skipped: Override for skip detection. If None, uses self._skip_current_file.
-        """
-        if not self.enabled:
-            return
-        # Dynamically get terminal width for each render (handles window resize)
-        terminal_width = shutil.get_terminal_size((80, 20)).columns
-        # Use provided skipped value or fall back to instance variable
-        effective_skipped = skipped if skipped is not None else self._skip_current_file
-        if effective_skipped and not final:
-            return  # Don't render skipped files unless forced
-
-        now = time.time()
-        if not final and now - self.last_update < 0.25 and self.current_file_copied < self.current_file_size:
-            return
-        self.last_update = now
-
-        # For skipped files, current_file_copied equals file_size immediately
-        # But we don't add it to total_progress_bytes since the file is already in completed_bytes
-        # Only add current_file_copied if it's less than file_size (i.e., file is actually being copied)
-        if self._skip_current_file:
-            # Skipped file: current_file_copied is just for display (file_pct), not actual progress
-            total_progress_bytes = self.completed_bytes
-            remaining_bytes = self.total_bytes - total_progress_bytes
-            total_pct = (total_progress_bytes / self.total_bytes * 100) if self.total_bytes > 0 else 100
-            file_pct = (self.current_file_copied / self.current_file_size * 100) if self.current_file_size > 0 else 100
-        else:
-            # Normal file being copied
-            total_progress_bytes = self.completed_bytes + self.current_file_copied
-            remaining_bytes = self.total_bytes - total_progress_bytes
-            total_pct = (total_progress_bytes / self.total_bytes * 100) if self.total_bytes > 0 else 100
-            file_pct = (self.current_file_copied / self.current_file_size * 100) if self.current_file_size > 0 else 100
-
-        elapsed = now - self.start_time
-        # Use actual transfer speed (based on total elapsed time, not just completed bytes)
-        # This includes current file progress for accurate ETA
-        avg_speed = total_progress_bytes / elapsed if elapsed > 0 else 0
-        total_eta = remaining_bytes / avg_speed if avg_speed > 0 else 0
-
-        file_elapsed = now - self.file_start_time
-        file_speed = self.current_file_copied / file_elapsed if file_elapsed > 0 else 0
-        remaining_file_bytes = self.current_file_size - self.current_file_copied
-        file_eta = remaining_file_bytes / file_speed if file_speed > 0 else 0
-
-        total_bar = self._make_bar(total_pct, 20)
-        file_bar = self._make_bar(file_pct, 20)
-
-        # Show basename of file (last component of path) to avoid truncation
-        import os
-        name_display = os.path.basename(self.current_file)[:25].ljust(25)
-        if terminal_width >= 100:
-            line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files) + " | " + format_size(self.completed_bytes) + "/" + format_size(self.total_bytes) + " | ETA: " + format_time(total_eta)
-            line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display + " | " + format_size(self.current_file_copied) + "/" + format_size(self.current_file_size) + " | " + format_speed(self.current_file_copied, file_elapsed) + " | ETA: " + format_time(file_eta)
-        else:
-            line1 = "总进度: " + total_bar + " " + format(total_pct, '5.1f') + "% | " + str(self.completed_files) + "/" + str(self.total_files)
-            line2 = "当前:   " + file_bar + " " + format(file_pct, '5.1f') + "% | " + name_display
-
-        # Use truncate_display_width instead of ljust to avoid terminal auto-wrap
-        line1_trunc = truncate_display_width(line1, terminal_width)
-        line2_trunc = truncate_display_width(line2, terminal_width)
-        
-        # Use ANSI cursor control: move up 2 lines, clear lines, print new content
-        if self._first_render:
-            # First render: just print, use \033[K to clear current line
-            output = f"\r\033[K{line1_trunc}\n\r\033[K{line2_trunc}\n"
-            self._first_render = False
-        else:
-            # Subsequent renders: move up 2 lines, clear and overwrite
-            output = f"\033[2A\r\033[K{line1_trunc}\n\r\033[K{line2_trunc}\n"
-        sys.stdout.write(output)
-        sys.stdout.flush()
-
-    def print_progress_line(self, current: int, total: int, current_file: str, stats: dict):
-        """Print single-line progress (mirrors legacy print_progress function)."""
-        pct = (current / total) * 100 if total > 0 else 0
-        bar_len = 30
-        filled = int(bar_len * current / total) if total > 0 else 0
-        bar = chr(9608) * filled + chr(9601) * (bar_len - filled)
-        display_name = current_file[:40] + "..." if len(current_file) > 40 else current_file
-        speed = format_speed(stats.get('bytes', 0), stats.get('time', 1))
-        
-        # Dynamically get terminal width
-        terminal_width = get_terminal_width()
-        progress_line = f"[{bar}] {pct:5.1f}% ({current}/{total}) | {speed} | {display_name}"
-        
-        # Truncate instead of ljust to avoid terminal auto-wrap
-        safe_line = truncate_display_width(progress_line, terminal_width - 1)
-        sys.stdout.write(f"\r\033[K{safe_line}")
-        sys.stdout.flush()
-        
-        if current >= total:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-
-    def print_message(self, msg: str):
-        """安全地在进度条运行期间打印消息，防止游标错乱"""
-        with self._lock:
-            if self.enabled and not self._first_render:
-                # 向上移动到进度条起点，并清除屏幕下方所有内容
-                sys.stdout.write("\033[2A\r\033[J")
-                sys.stdout.flush()
-            
-            # 打印消息（自带换行）
-            print(msg, file=sys.stderr)
-            
-            # 强制下一次渲染为"首次渲染"，从而把进度条画在消息的下方
-            if self.enabled:
-                self._first_render = True
-
-    def _make_bar(self, pct: float, length: int) -> str:
-        filled = int(length * pct / 100)
-        return f"{ANSIColors.PROGRESS_BAR_FILLED}{chr(9608) * filled}{ANSIColors.PROGRESS_BAR_EMPTY}{chr(9601) * (length - filled)}{ANSIColors.RESET}"
-
-
 class CheckpointManager:
     """断点续传状态管理"""
 
     def __init__(self, source: Path, target: Path, checkpoint_file: Optional[Path] = None, interval: int = 10):
         self.source = source
         self.target = target
-        self.checkpoint_file = checkpoint_file or (target / ".sync-progress.json")
+        self.checkpoint_file = checkpoint_file or (target / CHECKPOINT_FILENAME)
         self.interval = interval # Add this line
         self.state = self._load_or_create_state()
 
@@ -1193,26 +965,6 @@ class OutputManager:
         if self._progress:
             self._progress.finalize()
             self._progress = None
-    
-    # 兼容旧 print_progress 函数的功能
-    def print_progress(self, current: int, total: int, current_file: str, stats: dict):
-        """打印简单进度(单行)"""
-        pct = (current / total) * 100 if total > 0 else 0
-        bar_len = 30
-        filled = int(bar_len * current / total) if total > 0 else 0
-        bar = "█" * filled + "░" * (bar_len - filled)
-        display_name = current_file[:40] + "..." if len(current_file) > 40 else current_file
-        speed = format_speed(stats.get('bytes', 0), stats.get('time', 1))
-
-        progress_line = f"[{bar}] {pct:5.1f}% ({current}/{total}) | {speed} | {display_name}"
-
-        # 动态获取终端宽度
-        terminal_width = self._get_terminal_width()
-        # Pad with spaces to clear the line
-        self._write(f"\r{progress_line.ljust(terminal_width)}", sys.stdout)
-
-        if current >= total:
-            self._write("\n", sys.stdout)
 
 
 # =============================================================================
@@ -1227,25 +979,43 @@ class AuditLogger:
         self.log_path = log_path
         self.enabled = enabled
         self._lock = threading.Lock()
-        
+
         if self.enabled:
-            # 写入日志头
-            with open(self.log_path, 'a', encoding='utf-8') as f:
-                f.write("\n" + "=" * 80 + "\n")
-                f.write(f"folder-sync-pro Audit Log\n")
-                f.write(f"Started: {datetime.now().isoformat()}\n")
-                f.write("=" * 80 + "\n\n")
+            # 写入日志头。目标盘只读/无权限时不要把整次运行掀掉 ——
+            # 审计日志是附加产物,拿不到就降级成"不记录"并明确告知。
+            try:
+                self._write_header()
+            except OSError as e:
+                self.enabled = False
+                print(f"{ANSIColors.STATUS_WARN} 无法写入审计日志 {self.log_path}: {e},"
+                      f"本次运行不记录审计日志", file=sys.stderr)
+
+    def _write_header(self):
+        """写入日志头(失败时由调用方降级处理)"""
+        with open(self.log_path, 'a', encoding='utf-8') as f:
+            f.write("\n" + "=" * 80 + "\n")
+            f.write(f"folder-sync-pro Audit Log v{__version__}\n")
+            f.write(f"Started: {datetime.now().isoformat()}\n")
+            f.write("=" * 80 + "\n\n")
 
     def log(self, message: str, level: str = "INFO"):
         """记录日志 - 只写入文件，不打印到 stderr（避免与正常输出重复）"""
+        if not self.enabled:
+            return
+
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_line = f"[{timestamp}] [{level}] {message}"
-        
+
         # 只写入文件，不打印到 stderr（避免重复输出）
-        if self.enabled:
-            with self._lock:
+        # 写不进去也不能打断拷贝本身,记一次警告后彻底关掉。
+        with self._lock:
+            try:
                 with open(self.log_path, 'a', encoding='utf-8') as f:
                     f.write(log_line + "\n")
+            except OSError as e:
+                self.enabled = False
+                print(f"{ANSIColors.STATUS_WARN} 审计日志写入失败,已停止记录: {e}",
+                      file=sys.stderr)
 
     def log_file_start(self, rel_path: str, size: int):
         self.log(f"开始拷贝: {rel_path} ({format_size(size)})")
@@ -1270,6 +1040,27 @@ class AuditLogger:
         self.log(f"平均速度: {format_speed(total_bytes, elapsed_time)}", "INFO")
         self.log("=" * 80, "INFO")
         self.log(f"Completed: {datetime.now().isoformat()}", "INFO")
+
+
+def audit_log_enabled(args) -> bool:
+    """审计日志默认开启,只有显式 --no-audit-log 才关掉"""
+    return not getattr(args, "no_audit_log", False)
+
+
+def create_audit_logger(target: Path, enabled: bool = True) -> AuditLogger:
+    """在目标文件夹里建一份带时间戳的审计日志
+
+    审计日志是 README 承诺的交付"铁证",默认就该有,和 --progress、
+    --verify、多源模式都无关(以前只有带 --progress 的单源拷贝才会产生)。
+    目标目录还不存在时先建出来,否则第一行日志就写不下去。
+    """
+    log_path = target / f"{AUDIT_LOG_PREFIX}{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    if enabled:
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass  # AuditLogger 自己会因为写不进去而降级
+    return AuditLogger(log_path, enabled=enabled)
 
 
 # =============================================================================
@@ -1636,7 +1427,7 @@ def generate_mhl_report(
 
     creatorinfo = ET.SubElement(hashlist, "creatorinfo")
     ET.SubElement(creatorinfo, "name").text = "Folder Sync Pro"
-    ET.SubElement(creatorinfo, "version").text = "1.0.0"
+    ET.SubElement(creatorinfo, "version").text = __version__
     ET.SubElement(creatorinfo, "hostname").text = socket.gethostname()
     ET.SubElement(creatorinfo, "tool").text = "check_sync_pro.py"
 
@@ -1675,7 +1466,7 @@ def generate_report(result: SyncResult) -> dict:
     report = {
         "metadata": {
             "tool": "Folder Sync Pro",
-            "version": "1.0.0",
+            "version": __version__,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "algorithm": result.algorithm,
             "double_verify": result.double_verify,
@@ -1918,12 +1709,10 @@ def sync_single_pair(
             audit_logger.log_file_start(rel_path, source_size)
 
         if verbose and not show_progress:
-            if shared_progress:
-                # Use ProgressManager's single-line progress method
-                shared_progress.print_progress_line(idx, files_to_copy_count, rel_path, stats)
-            else:
-                # Fallback to standalone function
-                print_progress(idx, files_to_copy_count, rel_path, stats)
+            # 单行进度统一走模块级 print_progress。以前这里会对 shared_progress
+            # 调用 print_progress_line,那是被遮蔽掉的旧 ProgressManager 才有的
+            # 方法,真正的 ProgressDisplay 上并不存在,走到就是 AttributeError。
+            print_progress(idx, files_to_copy_count, rel_path, stats)
 
         if target_path.exists() and skip_existing:
             result.skipped.append(rel_path)
@@ -2059,7 +1848,8 @@ def process_file_verify(
     result: SyncResult,
     args,
     algorithm: str,
-    verbose: bool
+    verbose: bool,
+    audit_logger: Optional['AuditLogger'] = None
 ) -> Optional[FileResult]:
     """处理校验模式下的单个文件"""
     try:
@@ -2069,6 +1859,8 @@ def process_file_verify(
         result.failed.append(rel_path)
         if verbose:
             print(f"\n❌ 无法读取文件大小: {rel_path} ({e})")
+        if audit_logger:
+            audit_logger.log_file_error(rel_path, f"无法读取文件大小: {e}")
         return None
 
     if source_size != target_size:
@@ -2081,6 +1873,8 @@ def process_file_verify(
         )
         result.files.append(file_result)
         result.failed.append(rel_path)
+        if audit_logger:
+            audit_logger.log_file_error(rel_path, f"文件大小不匹配: {source_size} != {target_size}")
         return None
 
     source_hash, _, _, error = compute_file_hash(source_path, algorithm, retries=args.retries)
@@ -2093,6 +1887,8 @@ def process_file_verify(
         )
         result.files.append(file_result)
         result.failed.append(rel_path)
+        if audit_logger:
+            audit_logger.log_file_error(rel_path, f"源文件哈希计算失败: {error}")
         return None
 
     verified, target_hash, verify_error = verify_file_hash(
@@ -2113,11 +1909,17 @@ def process_file_verify(
         file_result.success = False
         file_result.error = f"目标文件读取失败: {verify_error}"
         result.failed.append(rel_path)
+        if audit_logger:
+            audit_logger.log_file_error(rel_path, f"目标文件读取失败: {verify_error}")
     elif not verified:
         file_result.error = "哈希值不匹配"
         result.failed.append(rel_path)
+        if audit_logger:
+            audit_logger.log_file_error(rel_path, f"哈希值不匹配: 源 {source_hash} / 目标 {target_hash}")
     else:
         result.copied.append(rel_path)
+        if audit_logger:
+            audit_logger.log(f"校验通过: {rel_path} | Hash: {source_hash}")
 
     result.files.append(file_result)
     return file_result
@@ -2164,6 +1966,10 @@ def run_verify(args, algorithm: str) -> int:
     )
     result.start_time = time.time()
 
+    # 校验模式同样要留下交付"铁证",以前这个模式一行审计日志都不写
+    audit_logger = create_audit_logger(target, enabled=audit_log_enabled(args))
+    audit_logger.log(f"校验模式: {source} → {target} | 算法: {algorithm.upper()}")
+
     stats = {'bytes': 0, 'time': 0}
     source_files = comparison['source_files']
     target_files = comparison['target_files']
@@ -2176,12 +1982,22 @@ def run_verify(args, algorithm: str) -> int:
             result,
             args,
             algorithm,
-            args.verbose
+            args.verbose,
+            audit_logger=audit_logger
         )
         result.total_bytes += source_files[rel_path].stat().st_size if source_files[rel_path].exists() else 0
         stats['bytes'] = result.total_bytes
 
     result.end_time = time.time()
+
+    audit_logger.log_summary(
+        total_files=len(result.files),
+        successful=len(result.copied),
+        skipped=0,
+        failed=len(result.failed),
+        total_bytes=result.total_bytes,
+        elapsed_time=result.end_time - result.start_time
+    )
 
     # 打印结果
     print_result_summary(result, args.verbose, Mode.VERIFY)
@@ -2215,11 +2031,29 @@ def _signal_handler(signum, frame):
     sys.exit(1)
 
 
+def run_clean_pollution(source: Path, args) -> None:
+    """--clean-pollution: 扫描之前先把源盘上的 macOS 污染文件删掉
+
+    必须在 scan_and_compare 之前调用: 污染文件本来就被 scan_folder 忽略,
+    放在扫描之后清理对本次拷贝没有任何影响,只有先清理才符合 README 说的
+    "在拷贝前删除这些文件"。源盘写保护时 clean_pollution_files 会逐个
+    报错并跳过,不会中断拷贝。
+    """
+    if not getattr(args, "clean_pollution", False):
+        return
+    cleaned = clean_pollution_files(source, args.verbose)
+    print(f"{ANSIColors.STATUS_OK} 已清理 {cleaned} 个 macOS 污染文件: {source}",
+          file=sys.stderr)
+
+
 def run_copy(args, algorithm: str) -> int:
     """拷贝模式入口"""
     global _global_checkpoint
 
     source, target = validate_paths(args)
+
+    # 清理源盘污染文件(必须在扫描之前)
+    run_clean_pollution(source, args)
 
     # 初始化进度和检查点管理器
     checkpoint_manager = None
@@ -2265,8 +2099,7 @@ def run_copy(args, algorithm: str) -> int:
         progress_manager = ProgressManager(files_to_copy_count, total_size, enabled=True)
 
     # 创建审计日志（与 MHL 同目录的 .log 文件）
-    audit_log_filename = f".sync_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    audit_logger = AuditLogger(target / audit_log_filename, enabled=args.progress)
+    audit_logger = create_audit_logger(target, enabled=audit_log_enabled(args))
 
     if checkpoint_manager:
         _global_checkpoint = checkpoint_manager
@@ -2334,6 +2167,10 @@ def run_multi_source(args, algorithm: str) -> int:
     if not validate_target_dirs(targets):
         return 1
 
+    # 清理源盘污染文件(必须在扫描之前)
+    for source in sources:
+        run_clean_pollution(source, args)
+
     source_target_pairs = [(s, t) for s in sources for t in targets]
     total_pairs = len(source_target_pairs)
 
@@ -2358,6 +2195,12 @@ def run_multi_source(args, algorithm: str) -> int:
     )
     has_unexpected_errors = False
 
+    # 每个目标盘一份审计日志,同一个目标的多个源共用(AuditLogger.log 自带锁,
+    # 并发模式下也安全)。以前多源模式完全不写审计日志。
+    audit_enabled = audit_log_enabled(args)
+    audit_loggers = {target: create_audit_logger(target, enabled=audit_enabled)
+                     for target in targets}
+
     if args.parallel <= 1:
         for source, target in source_target_pairs:
             if args.verbose:
@@ -2366,7 +2209,8 @@ def run_multi_source(args, algorithm: str) -> int:
                 source=source, target=target, algorithm=algorithm,
                 double_verify=args.double_verify, skip_existing=args.skip_existing,
                 preserve_metadata=args.preserve_metadata, preserve_xattr=args.preserve_xattr,
-                sidecar=args.sidecar, retries=args.retries, verbose=args.verbose
+                sidecar=args.sidecar, retries=args.retries, verbose=args.verbose,
+                audit_logger=audit_loggers[target]
             )
             result.project_name = args.project_name or f"{source.name}_to_{target.name}"
             multi_result.results.append(result)
@@ -2379,7 +2223,8 @@ def run_multi_source(args, algorithm: str) -> int:
                     source=source, target=target, algorithm=algorithm,
                     double_verify=args.double_verify, skip_existing=args.skip_existing,
                     preserve_metadata=args.preserve_metadata, preserve_xattr=args.preserve_xattr,
-                    sidecar=args.sidecar, retries=args.retries, verbose=False
+                    sidecar=args.sidecar, retries=args.retries, verbose=False,
+                    audit_logger=audit_loggers[target]
                 )
                 future_to_pair[future] = (source, target)
 
@@ -2451,7 +2296,7 @@ def run_multi_source(args, algorithm: str) -> int:
         combined_report = {
             "metadata": {
                 "tool": "Folder Sync Pro",
-                "version": "1.0.0",
+                "version": __version__,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "algorithm": algorithm,
                 "sources": [str(s) for s in sources],
@@ -2527,6 +2372,12 @@ def parse_args() -> argparse.Namespace:
     # 基本参数
     parser.add_argument("source", nargs='?', help="源文件夹路径(存储卡)")
     parser.add_argument("target", nargs='?', help="目标文件夹路径")
+    parser.add_argument("--version", action="version",
+                        version=f"Folder Sync Pro {__version__}")
+
+    # 清理参数
+    parser.add_argument("--clean-pollution", action="store_true",
+                        help="拷贝前删除源盘上的 macOS 污染文件(.DS_Store、._* 等)")
 
     # 多源拷贝参数
     parser.add_argument("--sources", nargs='+', metavar="PATH",
@@ -2575,6 +2426,8 @@ def parse_args() -> argparse.Namespace:
                         help="显示详细进度")
     parser.add_argument("--verify", action="store_true",
                         help="校验模式:仅校验目标文件夹中已存在的文件,不拷贝新文件")
+    parser.add_argument("--no-audit-log", action="store_true",
+                        help="不生成审计日志(默认会在目标文件夹写 .sync_audit_*.log)")
 
     # 断点续传参数
     parser.add_argument("--progress", action="store_true",

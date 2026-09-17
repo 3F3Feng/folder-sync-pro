@@ -92,6 +92,7 @@ python3 check_sync_pro.py \
 |------|------|--------|
 | `source` | 源文件夹路径 | 必需 |
 | `target` | 目标文件夹路径 | 必需 |
+| `--version` | 显示版本号并退出 | — |
 
 ### 清理参数
 
@@ -118,6 +119,9 @@ python3 check_sync_pro.py \
 | `--report FILE` | 生成 JSON 报告 | 无 |
 | `--mhl` | 生成 ASC MHL v1.1 报告 | 否 |
 | `--sidecar` | 生成校验码伴随文件 | 否 |
+| `--no-audit-log` | 不生成审计日志 | 否（审计日志默认开启） |
+
+> **注意**：审计日志（`.sync_audit_*.log`）在拷贝、校验和多源三种模式下都会默认写入目标文件夹，不再依赖 `--progress`。只有明确传 `--no-audit-log` 才会关闭。目标盘只读或写入失败时会打印一条警告并降级为不记录，不会中断拷贝。
 
 ### 哈希参数
 
@@ -125,12 +129,22 @@ python3 check_sync_pro.py \
 |------|------|--------|
 | `--hash ALG` | 哈希算法（xxhash/md5/sha256） | xxhash |
 
+### 拷贝参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--skip-existing` | 跳过目标已存在的文件（不做校验） | 否 |
+
 ### 断点续传
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--resume FILE` | 从进度文件恢复 | 无 |
 | `--checkpoint N` | 每 N 秒保存进度 | 10 |
+
+> **注意（行为变更）**：`--progress` 仍然会创建断点文件，但**不再**顺带启用续传语义。续传只在 `--resume` 指向一份真实的进度文件时才生效。
+>
+> 这意味着：只带 `--progress` 时，目标端已经存在的同名文件会被**重新完整拷贝一遍**，而不是先比一次哈希再跳过。之所以收紧，是因为默认路径上不应该去信任目标盘上来路不明的文件——它可能是上一次拷到一半留下的残骸。要快速跳过已存在的文件，请显式使用 `--skip-existing`；要真正续传，请使用 `--resume`。
 
 ---
 
@@ -181,7 +195,8 @@ python3 check_sync_pro.py --resume /path/to/target/.sync-progress.json
 1. **容量预检** - 拷贝前检查目标磁盘空间（+5% buffer）
 2. **写保护检测** - 检测源盘是否只读，防止数据污染
 3. **断点校验** - 恢复拷贝时验证已存在部分的完整性
-4. **审计日志** - 所有操作记录到 `.sync_audit_*.log`
+4. **审计日志** - 所有操作默认记录到目标文件夹的 `.sync_audit_*.log`（`--no-audit-log` 可关闭）
+5. **产物自排除** - 工具自己写出的 `.sync-progress.json`、`.sync_audit_*.log` 和 `.mhl` 不参与扫描与比对，不会在下一次 `--verify` 里被报成"仅存在于目标文件夹"
 
 ### 性能数据
 
@@ -218,6 +233,23 @@ python3 check_sync_pro.py --resume /path/to/target/.sync-progress.json
 ---
 
 ## 🆕 更新日志
+
+> 版本号以 `check_sync_pro.py` 里的 `__version__` 为准，MHL 报告、JSON 报告和 `--version` 都从这一个常量读取。
+
+### 未发布
+
+#### 新增功能
+- ✨ **`--clean-pollution` 真正可用** - 参数与调用点补齐，拷贝前清理源盘 macOS 污染文件
+- ✨ **`--version`** - 输出版本号
+- ✨ **审计日志默认开启** - 拷贝、校验、多源三种模式都会写 `.sync_audit_*.log`，新增 `--no-audit-log` 用于关闭
+
+#### 修复
+- 🐛 工具自身产物（`.sync-progress.json`、`.sync_audit_*.log`、`.mhl`）不再被扫描，`--verify` 不会再把它们报成"仅存在于目标文件夹"
+- 🐛 版本号统一到 `__version__`，不再有三份硬编码的 `1.0.0`
+- 🐛 清理被遮蔽的重复实现（旧 `OutputManager` / `ProgressManager`、重复的 `print_progress`、导入时算死的 `TERMINAL_WIDTH`）
+
+#### 行为变更
+- ⚠️ `--progress` 不再顺带启用续传语义，详见"断点续传"一节
 
 ### v1.1.0 (2026-04-06)
 

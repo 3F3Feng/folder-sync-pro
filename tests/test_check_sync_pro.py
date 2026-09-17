@@ -1372,3 +1372,252 @@ class TestPathValidation:
         
         shutil.rmtree(temp_dir)
 
+
+class TestCleanPollutionOption:
+    """--clean-pollution 以前只有函数和 README,没有参数也没有调用点"""
+
+    def _make_tree(self):
+        base = Path(tempfile.mkdtemp())
+        src = base / "src"
+        dst = base / "dst"
+        (src / "DCIM").mkdir(parents=True)
+        (src / "DCIM" / "IMG_0001.CR3").write_bytes(b"camera-data")
+        (src / "DCIM" / ".DS_Store").write_bytes(b"junk")
+        (src / "DCIM" / "._IMG_0001.CR3").write_bytes(b"junk")
+        return base, src, dst
+
+    def test_flag_exists_and_defaults_off(self, monkeypatch):
+        """--clean-pollution 必须真的是一个命令行参数"""
+        monkeypatch.setattr(sys, "argv", ["check_sync_pro.py", "a", "b"])
+        assert sync_pro.parse_args().clean_pollution is False
+        monkeypatch.setattr(sys, "argv", ["check_sync_pro.py", "a", "b", "--clean-pollution"])
+        assert sync_pro.parse_args().clean_pollution is True
+
+    def test_copy_with_flag_deletes_source_pollution(self, monkeypatch):
+        """带 --clean-pollution 时污染文件在拷贝前就被删掉"""
+        base, src, dst = self._make_tree()
+        try:
+            monkeypatch.setattr(sys, "argv", [
+                "check_sync_pro.py", str(src), str(dst), "--clean-pollution", "--no-audit-log"
+            ])
+            with pytest.raises(SystemExit) as e:
+                sync_pro.main()
+            assert e.value.code == 0
+
+            assert not (src / "DCIM" / ".DS_Store").exists()
+            assert not (src / "DCIM" / "._IMG_0001.CR3").exists()
+            # 真正的素材一个都不能少
+            assert (src / "DCIM" / "IMG_0001.CR3").exists()
+            assert (dst / "DCIM" / "IMG_0001.CR3").read_bytes() == b"camera-data"
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_copy_without_flag_keeps_source_pollution(self, monkeypatch):
+        """不带参数时源盘保持原样(污染文件本来就不会被拷贝)"""
+        base, src, dst = self._make_tree()
+        try:
+            monkeypatch.setattr(sys, "argv", [
+                "check_sync_pro.py", str(src), str(dst), "--no-audit-log"
+            ])
+            with pytest.raises(SystemExit):
+                sync_pro.main()
+
+            assert (src / "DCIM" / ".DS_Store").exists()
+            assert not (dst / "DCIM" / ".DS_Store").exists()
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
+class TestScanFolderSkipsToolArtifacts:
+    """工具自己写进目标盘的产物以前会被 --verify 报成「仅存在于目标文件夹」"""
+
+    def test_scan_skips_own_artifacts(self):
+        base = Path(tempfile.mkdtemp())
+        try:
+            (base / "IMG_0001.CR3").write_bytes(b"data")
+            (base / ".sync-progress.json").write_text("{}")
+            (base / ".sync_audit_20260101_120000.log").write_text("log")
+            (base / "project_20260101_120000.mhl").write_text("<hashlist/>")
+
+            files = sync_pro.scan_folder(base)
+
+            assert "IMG_0001.CR3" in files
+            assert ".sync-progress.json" not in files
+            assert ".sync_audit_20260101_120000.log" not in files
+            assert "project_20260101_120000.mhl" not in files
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_is_tool_artifact_cases(self):
+        assert sync_pro.is_tool_artifact(".sync-progress.json")
+        assert sync_pro.is_tool_artifact(".sync_audit_20260101_120000.log")
+        assert sync_pro.is_tool_artifact("report.mhl")
+        assert sync_pro.is_tool_artifact("REPORT.MHL")
+        # 普通素材和普通日志不能被误伤
+        assert not sync_pro.is_tool_artifact("IMG_0001.CR3")
+        assert not sync_pro.is_tool_artifact("camera.log")
+        assert not sync_pro.is_tool_artifact("sync-progress.json")
+
+    def test_verify_after_copy_reports_no_target_only_files(self, monkeypatch, capsys):
+        """拷贝 → 校验的完整流程里,目标盘不应该冒出"多余"文件"""
+        base = Path(tempfile.mkdtemp())
+        src, dst = base / "src", base / "dst"
+        src.mkdir()
+        (src / "IMG_0001.CR3").write_bytes(b"camera-data")
+        try:
+            monkeypatch.setattr(sys, "argv", [
+                "check_sync_pro.py", str(src), str(dst), "--mhl"
+            ])
+            with pytest.raises(SystemExit):
+                sync_pro.main()
+
+            comparison = sync_pro.scan_and_compare(src, dst)
+            assert comparison['only_target'] == set()
+            assert comparison['common'] == {"IMG_0001.CR3"}
+            # 产物确实写出来了,只是不参与比较
+            assert list(dst.glob("*.mhl"))
+            assert list(dst.glob(".sync_audit_*.log"))
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
+class TestAuditLogDecoupledFromProgress:
+    """审计日志是 README 承诺的"铁证",以前只有 --progress 才会生成"""
+
+    def _tree(self):
+        base = Path(tempfile.mkdtemp())
+        src, dst = base / "src", base / "dst"
+        src.mkdir()
+        (src / "IMG_0001.CR3").write_bytes(b"camera-data")
+        return base, src, dst
+
+    def test_copy_without_progress_still_writes_audit_log(self, monkeypatch):
+        base, src, dst = self._tree()
+        try:
+            monkeypatch.setattr(sys, "argv", ["check_sync_pro.py", str(src), str(dst)])
+            with pytest.raises(SystemExit):
+                sync_pro.main()
+
+            logs = list(dst.glob(".sync_audit_*.log"))
+            assert len(logs) == 1
+            assert "IMG_0001.CR3" in logs[0].read_text(encoding="utf-8")
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_verify_mode_writes_audit_log(self, monkeypatch):
+        base, src, dst = self._tree()
+        dst.mkdir()
+        shutil.copy2(src / "IMG_0001.CR3", dst / "IMG_0001.CR3")
+        try:
+            monkeypatch.setattr(sys, "argv",
+                                ["check_sync_pro.py", str(src), str(dst), "--verify"])
+            with pytest.raises(SystemExit):
+                sync_pro.main()
+
+            logs = list(dst.glob(".sync_audit_*.log"))
+            assert len(logs) == 1
+            content = logs[0].read_text(encoding="utf-8")
+            assert "校验模式" in content
+            assert "校验通过: IMG_0001.CR3" in content
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_no_audit_log_flag_suppresses_file(self, monkeypatch):
+        base, src, dst = self._tree()
+        try:
+            monkeypatch.setattr(sys, "argv",
+                                ["check_sync_pro.py", str(src), str(dst), "--no-audit-log"])
+            with pytest.raises(SystemExit) as e:
+                sync_pro.main()
+
+            # 拷贝本身必须正常完成,只是不写审计日志
+            assert e.value.code == 0
+            assert (dst / "IMG_0001.CR3").read_bytes() == b"camera-data"
+            assert list(dst.glob(".sync_audit_*.log")) == []
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_multi_source_writes_audit_log_per_target(self, monkeypatch):
+        base = Path(tempfile.mkdtemp())
+        src, t1, t2 = base / "src", base / "t1", base / "t2"
+        src.mkdir()
+        (src / "IMG_0001.CR3").write_bytes(b"camera-data")
+        try:
+            monkeypatch.setattr(sys, "argv", [
+                "check_sync_pro.py", "--sources", str(src), "--targets", str(t1), str(t2)
+            ])
+            with pytest.raises(SystemExit):
+                sync_pro.main()
+
+            assert len(list(t1.glob(".sync_audit_*.log"))) == 1
+            assert len(list(t2.glob(".sync_audit_*.log"))) == 1
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_unwritable_target_degrades_instead_of_crashing(self, capsys):
+        """拿不到日志文件时只降级,不能把整次拷贝掀掉"""
+        base = Path(tempfile.mkdtemp())
+        try:
+            logger = sync_pro.AuditLogger(base / "no_such_dir" / "audit.log", enabled=True)
+            assert logger.enabled is False
+            assert "无法写入审计日志" in capsys.readouterr().err
+            logger.log("不应该抛异常")
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
+class TestVersionSingleSourceOfTruth:
+    """版本号以前在三个地方各写一份 "1.0.0",和 README 的 v1.1.0 对不上"""
+
+    def test_module_version_matches_readme_changelog(self):
+        assert sync_pro.__version__ == "1.1.0"
+
+    def test_json_report_uses_version_constant(self):
+        result = sync_pro.SyncResult(source=Path("/s"), target=Path("/t"),
+                                     algorithm="md5")
+        report = sync_pro.generate_report(result)
+        assert report["metadata"]["version"] == sync_pro.__version__
+
+    def test_mhl_report_uses_version_constant(self):
+        base = Path(tempfile.mkdtemp())
+        try:
+            result = sync_pro.SyncResult(source=Path("/s"), target=base, algorithm="md5")
+            result.files.append(sync_pro.FileResult(
+                relative_path="a.mov", source_size=4, target_size=4,
+                source_hash="abcd", success=True))
+            mhl_path = sync_pro.generate_mhl_report(result, base / "out.mhl")
+            assert f"<version>{sync_pro.__version__}</version>" in mhl_path.read_text()
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_cli_version_flag(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["check_sync_pro.py", "--version"])
+        with pytest.raises(SystemExit) as e:
+            sync_pro.parse_args()
+        assert e.value.code == 0
+        assert sync_pro.__version__ in capsys.readouterr().out
+
+
+class TestDeadCodeRemoved:
+    """被遮蔽的重复实现已经删掉,留下的必须是后定义的那一份"""
+
+    def test_progress_manager_is_progress_display_alias(self):
+        assert sync_pro.ProgressManager is sync_pro.ProgressDisplay
+
+    def test_shadowed_progress_manager_method_is_gone(self):
+        # print_progress_line 只存在于被遮蔽的旧 ProgressManager 上,
+        # sync_single_pair 曾经会对 ProgressDisplay 调用它 -> AttributeError
+        assert not hasattr(sync_pro.ProgressDisplay, "print_progress_line")
+
+    def test_output_manager_is_the_later_definition(self):
+        # 后定义的那个才有 DEBUG/INFO 级别常量和 progress_start
+        assert hasattr(sync_pro.OutputManager, "progress_start")
+        assert sync_pro.OutputManager.INFO == 1
+        # print_progress 的第三份拷贝已经删掉,只留模块级函数
+        assert not hasattr(sync_pro.OutputManager, "print_progress")
+        assert callable(sync_pro.print_progress)
+
+    def test_stale_terminal_width_constant_is_gone(self):
+        # 以前在 import 时算一次就再也不更新
+        assert not hasattr(sync_pro, "TERMINAL_WIDTH")
+        assert sync_pro.get_terminal_width() > 0
