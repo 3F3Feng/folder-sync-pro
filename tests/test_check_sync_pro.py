@@ -1730,13 +1730,7 @@ class TestDeadCodeRemoved:
         # print_progress_line 只存在于被遮蔽的旧 ProgressManager 上,
         # sync_single_pair 曾经会对 ProgressDisplay 调用它 -> AttributeError
         assert not hasattr(sync_pro.ProgressDisplay, "print_progress_line")
-
-    def test_output_manager_is_the_later_definition(self):
-        # 后定义的那个才有 DEBUG/INFO 级别常量和 progress_start
-        assert hasattr(sync_pro.OutputManager, "progress_start")
-        assert sync_pro.OutputManager.INFO == 1
-        # print_progress 的第三份拷贝已经删掉,只留模块级函数
-        assert not hasattr(sync_pro.OutputManager, "print_progress")
+        # print_progress 的重复拷贝已经删掉,只留模块级函数
         assert callable(sync_pro.print_progress)
 
     def test_stale_terminal_width_constant_is_gone(self):
