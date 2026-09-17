@@ -28,6 +28,12 @@ Folder Sync Pro - 拷卡校验工具(专业版)
 # 1. Imports
 # =============================================================================
 
+# 注解延后求值。本文件里有前向引用的注解(如 _copy_and_hash_file 的
+# checkpoint_manager: Optional[CheckpointManager],而 CheckpointManager 在
+# 后面才定义)。Python 3.14 起(PEP 649)注解本就惰性求值,但本项目支持 3.9+,
+# 在 3.13 及以前注解会在 def 执行时立即求值,缺了这一行会直接 NameError。
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
