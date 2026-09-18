@@ -12,9 +12,11 @@ Tests the following features:
 - Sidecar file generation
 """
 
+import builtins
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -607,6 +609,127 @@ class TestProgressManager:
         assert "01:01:01" in result
 
 
+class TestProgressPercentageNeverExceeds100:
+    """
+    渲染出来的百分比不能冲过 100%
+
+    以前 _render_unlocked 在 final=True 的刷新路径上会把同一批字节数两遍:
+    start_file 的挂起刷新和 finalize 都是先把 _pending_completed_bytes 加进
+    completed_bytes 再渲染,而此刻 current_file_copied 还停在刚完成的那个文件上,
+    于是 total_progress_bytes = completed_bytes + current_file_copied 里有一份重复。
+    50MB + 20MB 的两文件拷贝上实测渲染出 142.9% 和 128.6%,单文件拷贝直接 200.0%。
+    """
+
+    ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+    PCT_RE = re.compile(r"([0-9]+\.[0-9])%")
+
+    def _rendered_pcts(self, capsys):
+        """把捕获到的进度输出里所有百分比取出来"""
+        out = self.ANSI_RE.sub("", capsys.readouterr().out)
+        return [float(v) for v in self.PCT_RE.findall(out)]
+
+    def _make(self, total_files, total_bytes):
+        # enabled=True 才会真正渲染;单行模式省掉光标上移,输出更好解析
+        return sync_pro.ProgressDisplay(
+            total_files=total_files, total_bytes=total_bytes,
+            enabled=True, dual_line=True,
+        )
+
+    def _copy_file(self, pm, name, size, chunks=4):
+        """模拟一个文件被完整拷完"""
+        pm.start_file(name, size)
+        for i in range(1, chunks + 1):
+            pm.update_file_progress(size * i // chunks)
+        pm.complete_file(size)
+
+    def test_single_file_stays_within_bounds(self, capsys):
+        # 修复前这里 finalize 会渲染出 200.0%
+        pm = self._make(1, 1000)
+        self._copy_file(pm, "only.bin", 1000)
+        pm.finalize()
+        pcts = self._rendered_pcts(capsys)
+        assert pcts, "should have rendered at least one progress line"
+        assert max(pcts) <= 100.0, f"rendered percentage over 100: {max(pcts)}"
+
+    def test_two_files_stays_within_bounds(self, capsys):
+        # 5:2 的大小比例正是复现出 142.9% / 128.6% 的那一组
+        pm = self._make(2, 70)
+        self._copy_file(pm, "a_big.bin", 50)
+        self._copy_file(pm, "b_small.bin", 20)
+        pm.finalize()
+        pcts = self._rendered_pcts(capsys)
+        assert pcts
+        assert max(pcts) <= 100.0, f"rendered percentage over 100: {max(pcts)}"
+
+    def test_many_small_files_stay_within_bounds(self, capsys):
+        sizes = [7 * i + 3 for i in range(1, 41)]
+        pm = self._make(len(sizes), sum(sizes))
+        for i, size in enumerate(sizes):
+            self._copy_file(pm, f"f{i}.bin", size, chunks=2)
+        pm.finalize()
+        pcts = self._rendered_pcts(capsys)
+        assert pcts
+        assert max(pcts) <= 100.0, f"rendered percentage over 100: {max(pcts)}"
+
+    def test_skipped_files_stay_within_bounds(self, capsys):
+        # --skip-existing 路径: start_file(skipped=True) 把 file_size 同时写进
+        # current_file_copied 和挂起的 completed_bytes
+        sizes = [120, 340, 55, 900]
+        pm = self._make(len(sizes), sum(sizes))
+        for i, size in enumerate(sizes):
+            pm.start_file(f"skip{i}.bin", size, skipped=True)
+            pm.complete_file(size)
+        pm.finalize()
+        pcts = self._rendered_pcts(capsys)
+        assert pcts
+        assert max(pcts) <= 100.0, f"rendered percentage over 100: {max(pcts)}"
+
+    def test_mixed_skip_and_copy_stays_within_bounds(self, capsys):
+        # 跳过和真拷交替,覆盖 _skip_current_file 在两次刷新之间翻转的情况
+        plan = [("a", 100, True), ("b", 250, False), ("c", 80, True), ("d", 70, False)]
+        pm = self._make(len(plan), sum(p[1] for p in plan))
+        for name, size, skipped in plan:
+            if skipped:
+                pm.start_file(name, size, skipped=True)
+                pm.complete_file(size)
+            else:
+                self._copy_file(pm, name, size, chunks=3)
+        pm.finalize()
+        pcts = self._rendered_pcts(capsys)
+        assert pcts
+        assert max(pcts) <= 100.0, f"rendered percentage over 100: {max(pcts)}"
+
+    def test_final_flush_does_not_double_count_completed_bytes(self, capsys):
+        """直接盯住根因: 刷新完成文件时总进度只能是 completed_bytes"""
+        pm = self._make(2, 70)
+        self._copy_file(pm, "a_big.bin", 50)
+        capsys.readouterr()  # 丢掉拷贝过程中的渲染,只看下面这次刷新
+        # 挂起的 50 字节在这里被 flush 进 completed_bytes 并渲染一次
+        pm.start_file("b_small.bin", 20)
+        assert pm.completed_bytes == 50
+        pcts = self._rendered_pcts(capsys)
+        assert pcts, "pending completion should have rendered a final line"
+        # 50/70 = 71.4%,修复前是 (50+50)/70 = 142.9%
+        assert pcts[0] == pytest.approx(71.4, abs=0.1)
+
+    def test_total_percentage_is_monotonic_and_ends_at_100(self, capsys):
+        """总进度不该回退,而且跑完必须正好到 100%"""
+        sizes = [50, 20, 30]
+        pm = self._make(len(sizes), sum(sizes))
+        for i, size in enumerate(sizes):
+            self._copy_file(pm, f"f{i}.bin", size, chunks=2)
+        pm.finalize()
+        out = self.ANSI_RE.sub("", capsys.readouterr().out)
+        totals = [
+            float(m) for m in
+            re.findall(r"总进度:.*?([0-9]+\.[0-9])%", out)
+        ]
+        assert totals, "should have rendered 总进度 lines"
+        assert totals == sorted(totals), f"total progress went backwards: {totals}"
+        assert max(totals) <= 100.0
+        assert totals[-1] == pytest.approx(100.0, abs=0.1)
+
+
 class TestCheckpointManager:
     """Test CheckpointManager for resume functionality"""
 
@@ -930,6 +1053,423 @@ class TestCopyAndHashFile:
         assert cm_reloaded.state["files"]["long_file.bin"]["hash"] == hash_val
 
 
+class TestCopyIntegrityRegressions:
+    """Regression tests for silent data-loss bugs in _copy_and_hash_file"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        """Create temporary source and target directories"""
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_retry_after_midwrite_failure_yields_identical_target(self, temp_dirs, monkeypatch):
+        """BUG-1: a write failure mid-copy must not leave a truncated target with a bogus hash"""
+        source, target = temp_dirs
+        chunk_size = 1024
+        source_data = os.urandom(chunk_size * 10)
+        source_file = source / "clip.bin"
+        source_file.write_bytes(source_data)
+        target_file = target / "clip.bin"
+
+        real_open = builtins.open
+        opens = {"count": 0}
+
+        class FailingWriter:
+            """Wraps the target file handle and fails part-way through the copy"""
+
+            def __init__(self, fh, chunks_before_failure):
+                self._fh = fh
+                self._remaining = chunks_before_failure
+
+            def write(self, data):
+                if self._remaining <= 0:
+                    raise OSError(28, "No space left on device")
+                self._remaining -= 1
+                return self._fh.write(data)
+
+            def __getattr__(self, name):
+                return getattr(self._fh, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return self._fh.__exit__(*exc_info)
+
+        def fake_open(file, mode='r', *args, **kwargs):
+            fh = real_open(file, mode, *args, **kwargs)
+            if Path(str(file)) == target_file and any(c in mode for c in ('w', 'a', '+')):
+                opens["count"] += 1
+                if opens["count"] == 1:
+                    # 第一次尝试写入 3 个块后模拟磁盘写满
+                    return FailingWriter(fh, chunks_before_failure=3)
+            return fh
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        monkeypatch.setattr(sync_pro.time, "sleep", lambda *_: None)
+
+        hash_val, _, bytes_copied, error = sync_pro._copy_and_hash_file(
+            source_file, target_file, "md5", chunk_size=chunk_size, retries=3
+        )
+
+        monkeypatch.undo()
+
+        assert opens["count"] >= 2  # 确认确实发生了重试
+        assert error == ""
+        # 目标文件必须与源文件逐字节一致,而不是丢掉开头的部分
+        assert target_file.read_bytes() == source_data
+        # 返回的哈希必须真正对应源文件/目标文件的内容
+        assert hash_val == hashlib.md5(source_data).hexdigest()
+        assert bytes_copied == len(source_data)
+
+    def test_existing_same_size_different_content_is_recopied(self, temp_dirs):
+        """BUG-2: a same-size target with different content must be re-copied, not trusted"""
+        source, target = temp_dirs
+
+        source_data = b"A" * 4096
+        stale_data = b"B" * 4096
+        source_file = source / "clip.mov"
+        source_file.write_bytes(source_data)
+        target_file = target / "clip.mov"
+        target_file.write_bytes(stale_data)
+
+        hash_val, _, bytes_copied, error = sync_pro._copy_and_hash_file(
+            source_file, target_file, "md5", resume=True
+        )
+
+        assert error == ""
+        # 返回的必须是源文件的哈希,而不是目标文件自己的哈希
+        assert hash_val == hashlib.md5(source_data).hexdigest()
+        assert target_file.read_bytes() == source_data
+        assert bytes_copied == len(source_data)
+
+    def test_progress_checkpoint_does_not_enable_resume(self, temp_dirs):
+        """BUG-2: --progress (checkpoint manager) alone must not enable resume semantics"""
+        source, target = temp_dirs
+
+        source_data = b"A" * 2048
+        stale_data = b"B" * 2048
+        (source / "a.mov").write_bytes(source_data)
+        (target / "a.mov").write_bytes(stale_data)
+
+        cm = sync_pro.CheckpointManager(source, target, target / ".sync-progress.json")
+
+        result = sync_pro.sync_single_pair(
+            source=source,
+            target=target,
+            algorithm="md5",
+            double_verify=True,
+            skip_existing=False,
+            preserve_metadata=True,
+            preserve_xattr=False,
+            sidecar=False,
+            retries=3,
+            verbose=False,
+            checkpoint_manager=cm,
+            resume=False
+        )
+
+        assert "a.mov" in result.copied
+        assert (target / "a.mov").read_bytes() == source_data
+
+        file_result = next(f for f in result.files if f.relative_path == "a.mov")
+        # source_hash 必须来自源文件,否则报告里的校验等于目标文件和自己比较
+        assert file_result.source_hash == hashlib.md5(source_data).hexdigest()
+
+        report = sync_pro.generate_report(result)
+        entry = next(f for f in report["files"] if f["path"] == "a.mov")
+        assert entry["verified"] is True
+        assert entry["source_hash"] == hashlib.md5(source_data).hexdigest()
+
+
+class TestUnicodeNormalizationKeying:
+    """BUG-3: NFD/NFC 文件名必须被当成同一个文件,否则校验模式会静默跳过"""
+
+    NFC_NAME = "café.mov"          # café,单个预组合字符
+    NFD_NAME = "café.mov"         # café,e + 组合音符
+
+    @pytest.fixture
+    def temp_dirs(self):
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_normalize_rel_key_unifies_nfc_and_nfd(self):
+        """规范化键必须把两种写法折叠成同一个字符串"""
+        assert self.NFC_NAME != self.NFD_NAME  # 前提: 它们确实是两个不同的字符串
+        assert sync_pro.normalize_rel_key(self.NFC_NAME) == sync_pro.normalize_rel_key(self.NFD_NAME)
+
+    def test_scan_and_compare_matches_nfd_against_nfc(self, temp_dirs, monkeypatch):
+        """源端 NFC、目标端 NFD 的同一个文件必须落在 common,而不是各自 only_*
+
+        这里用假的 os.walk,让测试不依赖运行测试的文件系统是否做规范化。
+        """
+        source, target = temp_dirs
+        walk_table = {
+            str(source): [(str(source), [], [self.NFC_NAME])],
+            str(target): [(str(target), [], [self.NFD_NAME])],
+        }
+
+        def fake_walk(folder):
+            return iter(walk_table[str(folder)])
+
+        monkeypatch.setattr(sync_pro.os, "walk", fake_walk)
+
+        comparison = sync_pro.scan_and_compare(source, target, verbose=False)
+
+        assert len(comparison['common']) == 1
+        assert comparison['only_source'] == set()
+        assert comparison['only_target'] == set()
+
+        # 字典里保存的必须是磁盘上的真实路径(而不是被规范化过的名字)
+        key = next(iter(comparison['common']))
+        assert comparison['source_files'][key].name == self.NFC_NAME
+        assert comparison['target_files'][key].name == self.NFD_NAME
+
+    def test_copy_uses_real_on_disk_name_not_normalized_key(self, temp_dirs, monkeypatch):
+        """拷贝时目标文件名必须沿用源文件磁盘上的真实写法"""
+        source, target = temp_dirs
+        real_name = self.NFD_NAME
+        source_file = source / real_name
+        try:
+            source_file.write_bytes(b"data")
+        except OSError:
+            pytest.skip("当前文件系统无法创建该文件名")
+        if real_name not in os.listdir(source):
+            pytest.skip("当前文件系统会自动规范化文件名,无法验证该行为")
+
+        result = sync_pro.sync_single_pair(
+            source=source, target=target, algorithm="md5",
+            double_verify=False, skip_existing=False,
+            preserve_metadata=False, preserve_xattr=False,
+            sidecar=False, retries=3, verbose=False
+        )
+
+        assert len(result.copied) == 1
+        assert real_name in os.listdir(target)
+
+
+class TestCaseCollisionDetection:
+    """BUG-4: 仅大小写不同的文件名在大小写不敏感的目标盘上会互相覆盖"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_detect_case_collisions_finds_pair(self):
+        files = {
+            "Clip.MOV": Path("/src/Clip.MOV"),
+            "clip.mov": Path("/src/clip.mov"),
+            "other.mov": Path("/src/other.mov"),
+        }
+        collisions = sync_pro.detect_case_collisions(files)
+        assert len(collisions) == 1
+        assert sorted(next(iter(collisions.values()))) == ["Clip.MOV", "clip.mov"]
+
+    def test_detect_case_collisions_empty_when_unique(self):
+        files = {"a.mov": Path("/src/a.mov"), "b.mov": Path("/src/b.mov")}
+        assert sync_pro.detect_case_collisions(files) == {}
+
+    def test_sync_aborts_on_case_insensitive_target(self, temp_dirs, monkeypatch, capsys):
+        """目标盘大小写不敏感时必须中止,而不是让两个文件互相静默覆盖"""
+        source, target = temp_dirs
+        (source / "Clip.MOV").write_bytes(b"AAAA")
+        # 只在字典里模拟出冲突,避免依赖测试文件系统能否同时创建这两个文件
+        pre_scanned = {
+            "Clip.MOV": source / "Clip.MOV",
+            "clip.mov": source / "clip.mov",
+        }
+
+        monkeypatch.setattr(sync_pro, "is_case_insensitive_fs", lambda _p: True)
+
+        result = sync_pro.sync_single_pair(
+            source=source, target=target, algorithm="md5",
+            double_verify=False, skip_existing=False,
+            preserve_metadata=False, preserve_xattr=False,
+            sidecar=False, retries=3, verbose=False,
+            pre_scanned_source_files=pre_scanned
+        )
+
+        assert result.aborted is True
+        assert result.abort_reason == "文件名大小写冲突"
+        assert result.copied == []
+        captured = capsys.readouterr()
+        assert "大小写" in captured.err
+
+    def test_sync_proceeds_on_case_sensitive_target(self, temp_dirs, monkeypatch, capsys):
+        """目标盘大小写敏感时两个文件合法共存,只警告不中止"""
+        source, target = temp_dirs
+        (source / "Clip.MOV").write_bytes(b"AAAA")
+        pre_scanned = {"Clip.MOV": source / "Clip.MOV"}
+
+        monkeypatch.setattr(sync_pro, "is_case_insensitive_fs", lambda _p: False)
+        monkeypatch.setattr(sync_pro, "detect_case_collisions",
+                            lambda _files: {"clip.mov": ["Clip.MOV", "clip.mov"]})
+
+        result = sync_pro.sync_single_pair(
+            source=source, target=target, algorithm="md5",
+            double_verify=False, skip_existing=False,
+            preserve_metadata=False, preserve_xattr=False,
+            sidecar=False, retries=3, verbose=False,
+            pre_scanned_source_files=pre_scanned
+        )
+
+        assert result.aborted is False
+        assert result.copied == ["Clip.MOV"]
+        assert "仅大小写不同" in capsys.readouterr().err
+
+
+class TestDiskSpacePrecheckRobustness:
+    """BUG-5: 扫描后源文件消失不能让整次拷贝直接崩掉"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_vanished_source_file_is_skipped(self, temp_dirs, capsys):
+        source, target = temp_dirs
+        present = source / "present.mov"
+        present.write_bytes(b"x" * 1024)
+        missing = source / "gone.mov"  # 从未创建 —— 模拟扫描后掉盘
+
+        can_proceed, msg = sync_pro.check_disk_space(
+            {"present.mov": present, "gone.mov": missing}, target
+        )
+
+        assert can_proceed is True
+        assert "无法读取大小" in capsys.readouterr().err
+
+    def test_all_files_vanished_still_returns(self, temp_dirs):
+        source, target = temp_dirs
+        can_proceed, msg = sync_pro.check_disk_space(
+            {"gone.mov": source / "gone.mov"}, target
+        )
+        assert can_proceed is True
+
+
+class TestInLoopSpeedStats:
+    """BUG-6: 循环内的速度统计用了还没赋值的 end_time,得到负数耗时"""
+
+    @pytest.fixture
+    def temp_dirs(self):
+        source = Path(tempfile.mkdtemp())
+        target = Path(tempfile.mkdtemp())
+        yield source, target
+        shutil.rmtree(source, ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_progress_stats_time_is_never_negative(self, temp_dirs, monkeypatch):
+        source, target = temp_dirs
+        for name in ("a.mov", "b.mov", "c.mov"):
+            (source / name).write_bytes(b"x" * 512)
+
+        seen = []
+
+        def fake_print_progress(current, total, current_file, stats):
+            seen.append(dict(stats))
+
+        monkeypatch.setattr(sync_pro, "print_progress", fake_print_progress)
+
+        sync_pro.sync_single_pair(
+            source=source, target=target, algorithm="md5",
+            double_verify=False, skip_existing=False,
+            preserve_metadata=False, preserve_xattr=False,
+            sidecar=False, retries=3, verbose=True
+        )
+
+        assert len(seen) == 3
+        assert all(s['time'] >= 0 for s in seen), seen
+        # 后面的调用必须看到真实的累计耗时
+        assert seen[-1]['time'] > 0
+
+
+class TestNumericArgValidation:
+    """输入校验: 0/负数以前会一路带到运行时"""
+
+    def _args(self, **overrides):
+        import argparse
+        values = {"parallel": 1, "retries": 3, "checkpoint": 10}
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_valid_defaults_pass(self):
+        sync_pro.validate_numeric_args(self._args())
+
+    @pytest.mark.parametrize("field,value", [
+        ("parallel", 0), ("parallel", -1), ("parallel", 999),
+        ("retries", 0), ("retries", -3), ("retries", 100),
+        ("checkpoint", 0), ("checkpoint", -10), ("checkpoint", 99999),
+    ])
+    def test_out_of_range_exits(self, field, value, capsys):
+        with pytest.raises(SystemExit) as e:
+            sync_pro.validate_numeric_args(self._args(**{field: value}))
+        assert e.value.code != 0
+        assert f"--{field}" in capsys.readouterr().err
+
+
+class TestMultiTargetValidation:
+    """输入校验: 多源模式以前完全没有校验 --targets"""
+
+    def test_missing_parent_rejected(self, capsys):
+        base = Path(tempfile.mkdtemp())
+        try:
+            bad = base / "no_such_dir" / "backup"
+            assert sync_pro.validate_target_dirs([bad]) is False
+            assert "上级目录不存在" in capsys.readouterr().err
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_target_is_file_rejected(self, capsys):
+        base = Path(tempfile.mkdtemp())
+        try:
+            not_a_dir = base / "file.txt"
+            not_a_dir.write_text("x")
+            assert sync_pro.validate_target_dirs([not_a_dir]) is False
+            assert "不是文件夹" in capsys.readouterr().err
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_existing_writable_target_accepted(self):
+        base = Path(tempfile.mkdtemp())
+        try:
+            assert sync_pro.validate_target_dirs([base]) is True
+            # 不存在但上级可写 —— 允许,拷贝时会自动创建
+            assert sync_pro.validate_target_dirs([base / "new_backup"]) is True
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_run_multi_source_rejects_bad_target(self, capsys):
+        import argparse
+        base = Path(tempfile.mkdtemp())
+        try:
+            source = base / "src"
+            source.mkdir()
+            args = argparse.Namespace(
+                sources=[str(source)],
+                targets=[str(base / "no_such_dir" / "backup")],
+                parallel=1, verbose=False, double_verify=False, skip_existing=False,
+                preserve_metadata=False, preserve_xattr=False, sidecar=False,
+                retries=3, project_name=None, mhl=False, report=None
+            )
+            assert sync_pro.run_multi_source(args, "md5") == 1
+            assert "上级目录不存在" in capsys.readouterr().err
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
 class TestPathValidation:
     """Test path validation logic"""
 
@@ -954,3 +1494,333 @@ class TestPathValidation:
         
         shutil.rmtree(temp_dir)
 
+
+class TestCleanPollutionOption:
+    """--clean-pollution 以前只有函数和 README,没有参数也没有调用点"""
+
+    def _make_tree(self):
+        base = Path(tempfile.mkdtemp())
+        src = base / "src"
+        dst = base / "dst"
+        (src / "DCIM").mkdir(parents=True)
+        (src / "DCIM" / "IMG_0001.CR3").write_bytes(b"camera-data")
+        (src / "DCIM" / ".DS_Store").write_bytes(b"junk")
+        (src / "DCIM" / "._IMG_0001.CR3").write_bytes(b"junk")
+        return base, src, dst
+
+    def test_flag_exists_and_defaults_off(self, monkeypatch):
+        """--clean-pollution 必须真的是一个命令行参数"""
+        monkeypatch.setattr(sys, "argv", ["check_sync_pro.py", "a", "b"])
+        assert sync_pro.parse_args().clean_pollution is False
+        monkeypatch.setattr(sys, "argv", ["check_sync_pro.py", "a", "b", "--clean-pollution"])
+        assert sync_pro.parse_args().clean_pollution is True
+
+    def test_copy_with_flag_deletes_source_pollution(self, monkeypatch):
+        """带 --clean-pollution 时污染文件在拷贝前就被删掉"""
+        base, src, dst = self._make_tree()
+        try:
+            monkeypatch.setattr(sys, "argv", [
+                "check_sync_pro.py", str(src), str(dst), "--clean-pollution", "--no-audit-log"
+            ])
+            with pytest.raises(SystemExit) as e:
+                sync_pro.main()
+            assert e.value.code == 0
+
+            assert not (src / "DCIM" / ".DS_Store").exists()
+            assert not (src / "DCIM" / "._IMG_0001.CR3").exists()
+            # 真正的素材一个都不能少
+            assert (src / "DCIM" / "IMG_0001.CR3").exists()
+            assert (dst / "DCIM" / "IMG_0001.CR3").read_bytes() == b"camera-data"
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_copy_without_flag_keeps_source_pollution(self, monkeypatch):
+        """不带参数时源盘保持原样(污染文件本来就不会被拷贝)"""
+        base, src, dst = self._make_tree()
+        try:
+            monkeypatch.setattr(sys, "argv", [
+                "check_sync_pro.py", str(src), str(dst), "--no-audit-log"
+            ])
+            with pytest.raises(SystemExit):
+                sync_pro.main()
+
+            assert (src / "DCIM" / ".DS_Store").exists()
+            assert not (dst / "DCIM" / ".DS_Store").exists()
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
+class TestScanFolderSkipsToolArtifacts:
+    """工具自己写进目标盘的产物以前会被 --verify 报成「仅存在于目标文件夹」"""
+
+    def test_scan_skips_own_artifacts(self):
+        base = Path(tempfile.mkdtemp())
+        try:
+            (base / "IMG_0001.CR3").write_bytes(b"data")
+            (base / ".sync-progress.json").write_text("{}")
+            (base / ".sync_audit_20260101_120000.log").write_text("log")
+            (base / "project_20260101_120000.mhl").write_text("<hashlist/>")
+
+            files = sync_pro.scan_folder(base)
+
+            assert "IMG_0001.CR3" in files
+            assert ".sync-progress.json" not in files
+            assert ".sync_audit_20260101_120000.log" not in files
+            assert "project_20260101_120000.mhl" not in files
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_is_tool_artifact_cases(self):
+        assert sync_pro.is_tool_artifact(".sync-progress.json")
+        assert sync_pro.is_tool_artifact(".sync_audit_20260101_120000.log")
+        assert sync_pro.is_tool_artifact("report.mhl")
+        assert sync_pro.is_tool_artifact("REPORT.MHL")
+        # 普通素材和普通日志不能被误伤
+        assert not sync_pro.is_tool_artifact("IMG_0001.CR3")
+        assert not sync_pro.is_tool_artifact("camera.log")
+        assert not sync_pro.is_tool_artifact("sync-progress.json")
+
+    def test_verify_after_copy_reports_no_target_only_files(self, monkeypatch, capsys):
+        """拷贝 → 校验的完整流程里,目标盘不应该冒出"多余"文件"""
+        base = Path(tempfile.mkdtemp())
+        src, dst = base / "src", base / "dst"
+        src.mkdir()
+        (src / "IMG_0001.CR3").write_bytes(b"camera-data")
+        try:
+            monkeypatch.setattr(sys, "argv", [
+                "check_sync_pro.py", str(src), str(dst), "--mhl"
+            ])
+            with pytest.raises(SystemExit):
+                sync_pro.main()
+
+            comparison = sync_pro.scan_and_compare(src, dst)
+            assert comparison['only_target'] == set()
+            assert comparison['common'] == {"IMG_0001.CR3"}
+            # 产物确实写出来了,只是不参与比较
+            assert list(dst.glob("*.mhl"))
+            assert list(dst.glob(".sync_audit_*.log"))
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
+class TestAuditLogDecoupledFromProgress:
+    """审计日志是 README 承诺的"铁证",以前只有 --progress 才会生成"""
+
+    def _tree(self):
+        base = Path(tempfile.mkdtemp())
+        src, dst = base / "src", base / "dst"
+        src.mkdir()
+        (src / "IMG_0001.CR3").write_bytes(b"camera-data")
+        return base, src, dst
+
+    def test_copy_without_progress_still_writes_audit_log(self, monkeypatch):
+        base, src, dst = self._tree()
+        try:
+            monkeypatch.setattr(sys, "argv", ["check_sync_pro.py", str(src), str(dst)])
+            with pytest.raises(SystemExit):
+                sync_pro.main()
+
+            logs = list(dst.glob(".sync_audit_*.log"))
+            assert len(logs) == 1
+            assert "IMG_0001.CR3" in logs[0].read_text(encoding="utf-8")
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_verify_mode_writes_audit_log(self, monkeypatch):
+        base, src, dst = self._tree()
+        dst.mkdir()
+        shutil.copy2(src / "IMG_0001.CR3", dst / "IMG_0001.CR3")
+        try:
+            monkeypatch.setattr(sys, "argv",
+                                ["check_sync_pro.py", str(src), str(dst), "--verify"])
+            with pytest.raises(SystemExit):
+                sync_pro.main()
+
+            logs = list(dst.glob(".sync_audit_*.log"))
+            assert len(logs) == 1
+            content = logs[0].read_text(encoding="utf-8")
+            assert "校验模式" in content
+            assert "校验通过: IMG_0001.CR3" in content
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_no_audit_log_flag_suppresses_file(self, monkeypatch):
+        base, src, dst = self._tree()
+        try:
+            monkeypatch.setattr(sys, "argv",
+                                ["check_sync_pro.py", str(src), str(dst), "--no-audit-log"])
+            with pytest.raises(SystemExit) as e:
+                sync_pro.main()
+
+            # 拷贝本身必须正常完成,只是不写审计日志
+            assert e.value.code == 0
+            assert (dst / "IMG_0001.CR3").read_bytes() == b"camera-data"
+            assert list(dst.glob(".sync_audit_*.log")) == []
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_multi_source_writes_audit_log_per_target(self, monkeypatch):
+        base = Path(tempfile.mkdtemp())
+        src, t1, t2 = base / "src", base / "t1", base / "t2"
+        src.mkdir()
+        (src / "IMG_0001.CR3").write_bytes(b"camera-data")
+        try:
+            monkeypatch.setattr(sys, "argv", [
+                "check_sync_pro.py", "--sources", str(src), "--targets", str(t1), str(t2)
+            ])
+            with pytest.raises(SystemExit):
+                sync_pro.main()
+
+            assert len(list(t1.glob(".sync_audit_*.log"))) == 1
+            assert len(list(t2.glob(".sync_audit_*.log"))) == 1
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_unwritable_target_degrades_instead_of_crashing(self, capsys):
+        """拿不到日志文件时只降级,不能把整次拷贝掀掉"""
+        base = Path(tempfile.mkdtemp())
+        try:
+            logger = sync_pro.AuditLogger(base / "no_such_dir" / "audit.log", enabled=True)
+            assert logger.enabled is False
+            assert "无法写入审计日志" in capsys.readouterr().err
+            logger.log("不应该抛异常")
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
+class TestVersionSingleSourceOfTruth:
+    """版本号以前在三个地方各写一份 "1.0.0",和 README 的 v1.1.0 对不上"""
+
+    def test_module_version_matches_readme_changelog(self):
+        assert sync_pro.__version__ == "1.1.0"
+
+    def test_json_report_uses_version_constant(self):
+        result = sync_pro.SyncResult(source=Path("/s"), target=Path("/t"),
+                                     algorithm="md5")
+        report = sync_pro.generate_report(result)
+        assert report["metadata"]["version"] == sync_pro.__version__
+
+    def test_mhl_report_uses_version_constant(self):
+        base = Path(tempfile.mkdtemp())
+        try:
+            result = sync_pro.SyncResult(source=Path("/s"), target=base, algorithm="md5")
+            result.files.append(sync_pro.FileResult(
+                relative_path="a.mov", source_size=4, target_size=4,
+                source_hash="abcd", success=True))
+            mhl_path = sync_pro.generate_mhl_report(result, base / "out.mhl")
+            assert f"<version>{sync_pro.__version__}</version>" in mhl_path.read_text()
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_cli_version_flag(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["check_sync_pro.py", "--version"])
+        with pytest.raises(SystemExit) as e:
+            sync_pro.parse_args()
+        assert e.value.code == 0
+        assert sync_pro.__version__ in capsys.readouterr().out
+
+
+class TestVerifyConsoleSummary:
+    """--verify 跑完只剩一屏进度条,通过/失败的总数以前只进审计日志"""
+
+    def _tree(self):
+        base = Path(tempfile.mkdtemp())
+        src, dst = base / "src", base / "dst"
+        src.mkdir()
+        dst.mkdir()
+        (src / "IMG_0001.CR3").write_bytes(b"camera-data")
+        shutil.copy2(src / "IMG_0001.CR3", dst / "IMG_0001.CR3")
+        return base, src, dst
+
+    def _run_verify(self, monkeypatch, capsys, src, dst, *extra):
+        monkeypatch.setattr(sys, "argv",
+                            ["check_sync_pro.py", str(src), str(dst), "--verify", *extra])
+        with pytest.raises(SystemExit) as e:
+            sync_pro.main()
+        return e.value.code, capsys.readouterr().out
+
+    def test_summary_prints_without_verbose(self, monkeypatch, capsys):
+        base, src, dst = self._tree()
+        try:
+            code, out = self._run_verify(monkeypatch, capsys, src, dst)
+            assert code == 0
+            # 摘要不能再被 --verbose 挡住
+            assert "📊 校验完成" in out
+            assert "对比文件: 1 个文件" in out
+            assert "校验通过: 1 个文件" in out
+            assert "失败文件: 0 个文件" in out
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_summary_reports_failures(self, monkeypatch, capsys):
+        base, src, dst = self._tree()
+        try:
+            # 目标文件被改坏:摘要必须当场把失败数和文件名摆出来
+            (dst / "IMG_0001.CR3").write_bytes(b"corrupted!!")
+            code, out = self._run_verify(monkeypatch, capsys, src, dst)
+            assert code == 1
+            assert "校验通过: 0 个文件" in out
+            assert "失败文件: 1 个文件" in out
+            assert "失败文件列表" in out
+            assert "IMG_0001.CR3" in out
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_summary_reports_only_source_and_only_target(self, monkeypatch, capsys):
+        base, src, dst = self._tree()
+        try:
+            (src / "IMG_0002.CR3").write_bytes(b"only-in-source")
+            (dst / "IMG_0003.CR3").write_bytes(b"only-in-target")
+            code, out = self._run_verify(monkeypatch, capsys, src, dst)
+            assert code == 0
+            assert "对比文件: 1 个文件" in out
+            assert "仅存在于源文件夹: 1 个文件" in out
+            assert "仅存在于目标文件夹: 1 个文件" in out
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_summary_matches_copy_summary_style(self, monkeypatch, capsys):
+        """配色、分隔线和字段排布跟拷贝模式的摘要保持一致"""
+        base, src, dst = self._tree()
+        try:
+            _, out = self._run_verify(monkeypatch, capsys, src, dst)
+            assert "=" * 50 in out
+            assert f"{sync_pro.ANSIColors.STATUS_OK} 校验通过:" in out
+            assert f"{sync_pro.ANSIColors.STATUS_ERROR} 失败文件:" in out
+            # validate_paths 会 resolve(),macOS 上 /var -> /private/var
+            assert f"源文件夹: {src.resolve()}" in out
+            assert f"目标文件夹: {dst.resolve()}" in out
+            assert "哈希算法:" in out
+            assert "总数据量:" in out
+            assert "总耗时:" in out
+            assert "平均速度:" in out
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_only_source_line_omitted_when_trees_match(self, monkeypatch, capsys):
+        base, src, dst = self._tree()
+        try:
+            _, out = self._run_verify(monkeypatch, capsys, src, dst)
+            assert "仅存在于源文件夹" not in out
+            assert "仅存在于目标文件夹" not in out
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
+class TestDeadCodeRemoved:
+    """被遮蔽的重复实现已经删掉,留下的必须是后定义的那一份"""
+
+    def test_progress_manager_is_progress_display_alias(self):
+        assert sync_pro.ProgressManager is sync_pro.ProgressDisplay
+
+    def test_shadowed_progress_manager_method_is_gone(self):
+        # print_progress_line 只存在于被遮蔽的旧 ProgressManager 上,
+        # sync_single_pair 曾经会对 ProgressDisplay 调用它 -> AttributeError
+        assert not hasattr(sync_pro.ProgressDisplay, "print_progress_line")
+        # print_progress 的重复拷贝已经删掉,只留模块级函数
+        assert callable(sync_pro.print_progress)
+
+    def test_stale_terminal_width_constant_is_gone(self):
+        # 以前在 import 时算一次就再也不更新
+        assert not hasattr(sync_pro, "TERMINAL_WIDTH")
+        assert sync_pro.get_terminal_width() > 0
